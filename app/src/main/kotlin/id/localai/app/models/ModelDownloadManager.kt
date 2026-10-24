@@ -57,13 +57,15 @@ object ModelCatalog {
         ModelManifestEntry(
             id = "qwen3.5-0.8b-q4_k_m",
             displayName = "Qwen3.5 0.8B",
-            roleSummary = "Ringan & cepat · Hemat memori untuk obrolan teks harian",
+            roleSummary = "Ringan & cepat · Visi opsional dengan mmproj",
             licenseName = "Apache-2.0",
             quantization = "GGUF Q4_K_M",
             ggufUrl = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
-            ggufSizeBytes = 533_000_000L,
-            supportsVision = false,
+            ggufSizeBytes = 532_517_120L,
+            supportsVision = true,
             promptFormat = PromptFormat.CHATML_QWEN,
+            projectorUrl = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf",
+            projectorSizeBytes = 204_987_232L,
             minFreeRamMb = 1600
         ),
         ModelManifestEntry(
