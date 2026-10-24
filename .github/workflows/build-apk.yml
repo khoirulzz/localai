@@ -64,7 +64,7 @@ jobs:
 
       - name: Package update ZIP
         run: |
-          zip -j Nalaro-AI-v0.4.1-APK.zip app/build/outputs/apk/debug/app-debug.apk
+          zip -j Nalaro-AI-v0.4.2-APK.zip app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -72,7 +72,7 @@ jobs:
           name: local-ai-debug-apk
           path: |
             app/build/outputs/apk/debug/*.apk
-            Nalaro-AI-v0.4.1-APK.zip
+            Nalaro-AI-v0.4.2-APK.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -86,6 +86,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk local-ai-debug.apk
-          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.1-APK.zip \
+          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.2-APK.zip \
             --title "Debug build #${{ github.run_number }}" \
             --notes "Debug APK (arm64-v8a), commit ${{ github.sha }}" --prerelease
