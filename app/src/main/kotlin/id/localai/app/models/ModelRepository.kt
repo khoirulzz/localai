@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -19,7 +21,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class DownloadStatus { IDLE, DOWNLOADING, VERIFYING, PAUSED, FAILED }
 
@@ -43,6 +48,7 @@ class ModelRepository(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val jobs = ConcurrentHashMap<String, Job>()
+    private val importCancel = ConcurrentHashMap<String, AtomicBoolean>()
 
     private val _installed = MutableStateFlow(computeInstalled())
     val installed: StateFlow<Set<String>> = _installed.asStateFlow()
@@ -100,10 +106,12 @@ class ModelRepository(
     }
 
     fun pause(entry: ModelManifestEntry) {
+        importCancel[entry.id]?.set(true)
         downloader.pauseDownload(entry.id)
     }
 
     fun delete(entry: ModelManifestEntry) {
+        importCancel[entry.id]?.set(true)
         downloader.pauseDownload(entry.id)
         val running = jobs.remove(entry.id)
         scope.launch {
@@ -111,6 +119,116 @@ class ModelRepository(
             downloader.deleteModelFiles(entry.id)
             _installed.update { it - entry.id }
             setState(entry.id, DownloadUi())
+        }
+    }
+
+    /**
+     * Impor berkas GGUF yang sudah ada di penyimpanan (mis. hasil unduhan di PC atau dari aplikasi
+     * lama) supaya tidak perlu mengunduh ulang. Berkas bernama "mmproj" dianggap proyektor visi,
+     * sisanya model utama. Hanya dicopy, tidak ada koneksi internet yang dipakai.
+     */
+    fun importFiles(entry: ModelManifestEntry, uris: List<Uri>) {
+        if (uris.isEmpty() || isDownloading(entry.id)) return
+        val cancel = AtomicBoolean(false)
+        importCancel[entry.id] = cancel
+        setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, 0L, entry.totalSizeBytes, null))
+
+        jobs[entry.id] = scope.launch {
+            var error: String? = null
+            var doneBefore = 0L
+            for (uri in uris) {
+                val name = displayName(uri)
+                val isProjector = name.contains("mmproj", ignoreCase = true)
+                if (isProjector && !entry.supportsVision) continue
+                val target = if (isProjector) downloader.getInstalledProjectorFile(entry.id)
+                else downloader.getInstalledGgufFile(entry.id)
+                val size = sizeOf(uri)
+                if (size > 0 && !downloader.hasEnoughSpaceFor(size)) {
+                    error = "Ruang penyimpanan tidak cukup untuk menyalin $name (butuh ${formatBytes(size)})."
+                    break
+                }
+                val err = copyGguf(uri, target, cancel) { copied ->
+                    setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, doneBefore + copied, entry.totalSizeBytes))
+                }
+                if (err != null) { error = err; break }
+                doneBefore += target.length()
+            }
+
+            when {
+                downloader.isInstalled(entry) -> {
+                    _installed.update { it + entry.id }
+                    setState(entry.id, DownloadUi())
+                }
+                cancel.get() -> setState(
+                    entry.id,
+                    DownloadUi(DownloadStatus.PAUSED, downloader.bytesOnDisk(entry), entry.totalSizeBytes)
+                )
+                else -> setState(
+                    entry.id,
+                    DownloadUi(
+                        DownloadStatus.FAILED,
+                        downloader.bytesOnDisk(entry),
+                        entry.totalSizeBytes,
+                        error ?: if (entry.supportsVision) "Model teks sudah masuk. Pilih juga berkas mmproj, atau tekan Coba lagi untuk mengunduh bagian yang kurang."
+                        else "Berkas tidak dikenali."
+                    )
+                )
+            }
+            importCancel.remove(entry.id)
+            jobs.remove(entry.id)
+        }
+    }
+
+    private fun displayName(uri: Uri): String = runCatching {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    }.getOrNull() ?: uri.lastPathSegment.orEmpty()
+
+    private fun sizeOf(uri: Uri): Long = runCatching {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
+            if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else -1L
+        }
+    }.getOrNull() ?: -1L
+
+    /** Salin ke .part, cek magic "GGUF", lalu rename atomik. Mengembalikan pesan error atau null. */
+    private fun copyGguf(uri: Uri, target: File, cancel: AtomicBoolean, onCopied: (Long) -> Unit): String? {
+        val dir = target.parentFile ?: return "Folder tujuan tidak valid."
+        dir.mkdirs()
+        val part = File(dir, "${target.name}.part")
+        try {
+            val input = context.contentResolver.openInputStream(uri) ?: return "Berkas tidak bisa dibuka."
+            input.use { ins ->
+                part.outputStream().use { out ->
+                    val buf = ByteArray(256 * 1024)
+                    var total = 0L
+                    var first = true
+                    var lastReport = 0L
+                    while (true) {
+                        if (cancel.get()) { part.delete(); return "Impor dihentikan." }
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        if (first) {
+                            first = false
+                            if (n < 4 || buf[0] != 'G'.code.toByte() || buf[1] != 'G'.code.toByte() ||
+                                buf[2] != 'U'.code.toByte() || buf[3] != 'F'.code.toByte()
+                            ) { part.delete(); return "Berkas ini bukan model GGUF yang valid." }
+                        }
+                        out.write(buf, 0, n)
+                        total += n
+                        val now = System.currentTimeMillis()
+                        if (now - lastReport >= 250L) { lastReport = now; onCopied(total) }
+                    }
+                    onCopied(total)
+                }
+            }
+            if (part.length() == 0L) { part.delete(); return "Berkas kosong." }
+            if (target.exists()) target.delete()
+            if (!part.renameTo(target)) return "Gagal memindahkan berkas model."
+            return null
+        } catch (e: IOException) {
+            part.delete()
+            return "Gagal menyalin berkas: ${e.message ?: "kesalahan penyimpanan"}"
         }
     }
 

@@ -10,14 +10,25 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "id.localai.app"
+        applicationId = "id.nalaro.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 2
+        versionName = "0.4.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // Keystore debug tetap di repo: tanpa ini, tiap build CI ditandatangani kunci acak dan
+    // pembaruan APK gagal terpasang di atas versi lama (data model ikut hilang bila harus uninstall).
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 

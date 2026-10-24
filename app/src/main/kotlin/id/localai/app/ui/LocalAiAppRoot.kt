@@ -21,6 +21,15 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import id.localai.app.LocalAiApp
 import id.localai.app.models.DownloadStatus
 import id.localai.app.models.formatBytes
+import id.localai.app.orchestrator.ContextBuilder
+import id.localai.app.ui.markdown.LinkifiedText
+import id.localai.app.ui.markdown.Markdown
+import id.localai.app.ui.markdown.MarkdownText
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.style.TextDecoration
+import java.util.Locale
+import kotlin.math.roundToInt
 import id.localai.app.search.TavilyKeyStore
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -107,6 +116,7 @@ fun LocalAiAppRoot() {
     var currentScreen by remember { mutableStateOf(ActiveScreen.CHAT) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val keyStore = remember { (context.applicationContext as LocalAiApp).graph.keyStore }
     var keyInput by remember { mutableStateOf("") }
     var showModelPicker by remember { mutableStateOf(false) }
@@ -134,6 +144,13 @@ fun LocalAiAppRoot() {
     val generationPhase = vm.generationPhase
 
     var composerText by remember { mutableStateOf("") }
+    var instrDraft by remember { mutableStateOf(vm.customInstructions) }
+    var importTarget by remember { mutableStateOf<ModelManifestEntry?>(null) }
+    val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
+        val target = importTarget
+        importTarget = null
+        if (target != null && uris.isNotEmpty()) vm.importModel(target, uris)
+    }
 
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val startModelDownload: (ModelManifestEntry) -> Unit = { entry ->
@@ -182,7 +199,7 @@ fun LocalAiAppRoot() {
                         drawerContentColor = colors.foreground
                     ) {
                         Column(modifier = Modifier.fillMaxHeight().padding(16.dp)) {
-                            Text("Local AI", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Text("Nalaro AI", style = LocalAiTypography.headerModel, color = colors.foreground)
                             Spacer(Modifier.height(12.dp))
                             DrawerRow("✎  Percakapan baru", colors) {
                                 startNewConversation()
@@ -371,7 +388,7 @@ fun LocalAiAppRoot() {
                                                                 Spacer(Modifier.height(4.dp))
                                                             }
                                                             SelectionContainer {
-                                                                Text(
+                                                                LinkifiedText(
                                                                     text = msg.text,
                                                                     style = LocalAiTypography.userBody,
                                                                     color = colors.foreground
@@ -394,11 +411,7 @@ fun LocalAiAppRoot() {
                                                         )
                                                     } else if (msg.text.isNotBlank()) {
                                                         SelectionContainer {
-                                                            Text(
-                                                                text = msg.text,
-                                                                style = LocalAiTypography.assistantBody,
-                                                                color = colors.foreground
-                                                            )
+                                                            MarkdownText(text = msg.text)
                                                         }
                                                     }
                                                     if (msg.status == "STOPPED") {
@@ -411,12 +424,23 @@ fun LocalAiAppRoot() {
                                                     }
                                                     if (msg.citations.isNotEmpty()) {
                                                         Spacer(Modifier.height(8.dp))
-                                                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                                        Row(
+                                                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                                                        ) {
                                                             msg.citations.forEach { cit ->
+                                                                val openable = cit.isWeb && Markdown.isSafeUrl(cit.urlOrPage)
                                                                 Text(
                                                                     text = cit.label,
                                                                     style = LocalAiTypography.metadata,
-                                                                    color = colors.secondaryText
+                                                                    color = if (openable) colors.foreground else colors.secondaryText,
+                                                                    textDecoration = if (openable) TextDecoration.Underline else null,
+                                                                    maxLines = 1,
+                                                                    modifier = if (openable) {
+                                                                        Modifier
+                                                                            .clickable { runCatching { uriHandler.openUri(cit.urlOrPage) } }
+                                                                            .padding(vertical = 6.dp)
+                                                                    } else Modifier.padding(vertical = 6.dp)
                                                                 )
                                                             }
                                                         }
@@ -596,7 +620,13 @@ fun LocalAiAppRoot() {
                                 Spacer(Modifier.width(12.dp))
                                 Text("Kelola model", style = LocalAiTypography.headerModel, color = colors.foreground)
                             }
-                            Spacer(Modifier.height(16.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "Sudah punya berkas model (.gguf)? Tekan Impor lalu pilih berkasnya, tanpa unduh ulang. Untuk model yang bisa membaca gambar, pilih juga berkas mmproj.",
+                                style = LocalAiTypography.metadata,
+                                color = colors.secondaryText
+                            )
+                            Spacer(Modifier.height(8.dp))
                             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                                 ModelCatalog.entries.forEach { entry ->
                                     val isInstalled = installedModelIds.contains(entry.id)
@@ -630,11 +660,21 @@ fun LocalAiAppRoot() {
                                                         Text("Lanjutkan", color = colors.foreground, modifier = Modifier.clickable { startModelDownload(entry) })
                                                         Text("Hapus", color = colors.secondaryText, modifier = Modifier.clickable { vm.deleteModel(entry) })
                                                     }
-                                                    else -> Text(
-                                                        if (status == DownloadStatus.FAILED) "Coba lagi" else "Unduh",
-                                                        color = colors.foreground,
-                                                        modifier = Modifier.clickable { startModelDownload(entry) }
-                                                    )
+                                                    else -> {
+                                                        Text(
+                                                            "Impor",
+                                                            color = colors.secondaryText,
+                                                            modifier = Modifier.clickable {
+                                                                importTarget = entry
+                                                                importPicker.launch(arrayOf("*/*"))
+                                                            }
+                                                        )
+                                                        Text(
+                                                            if (status == DownloadStatus.FAILED) "Coba lagi" else "Unduh",
+                                                            color = colors.foreground,
+                                                            modifier = Modifier.clickable { startModelDownload(entry) }
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
@@ -761,31 +801,114 @@ fun LocalAiAppRoot() {
                             }
 
                             Spacer(Modifier.height(28.dp))
-                            Text("Lanjutan", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Text("Instruksi kustom", style = LocalAiTypography.headerModel, color = colors.foreground)
                             Spacer(Modifier.height(8.dp))
-                            Text("Ukuran konteks (token)", style = LocalAiTypography.metadata, color = colors.secondaryText)
-                            Spacer(Modifier.height(6.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(1024, 2048, 4096).forEach { v ->
-                                    OptionChip(v.toString(), contextSize == v, colors) { vm.updateContextSize(v) }
-                                }
-                            }
+                            Text(
+                                "Ditambahkan ke aturan bawaan Nalaro AI di setiap percakapan. Contoh: \"Panggil saya Budi dan jawab dengan singkat.\"",
+                                style = LocalAiTypography.metadata,
+                                color = colors.secondaryText
+                            )
                             Spacer(Modifier.height(12.dp))
-                            Text("Thread CPU", style = LocalAiTypography.metadata, color = colors.secondaryText)
-                            Spacer(Modifier.height(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(colors.inputSurface)
+                                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                            ) {
+                                BasicTextField(
+                                    value = instrDraft,
+                                    onValueChange = { instrDraft = it.take(ContextBuilder.MAX_CUSTOM_INSTRUCTIONS) },
+                                    minLines = 4,
+                                    maxLines = 10,
+                                    textStyle = LocalAiTypography.composerInput.copy(color = colors.foreground),
+                                    cursorBrush = SolidColor(colors.foreground),
+                                    decorationBox = { inner ->
+                                        if (instrDraft.isEmpty()) {
+                                            Text("Tulis instruksi tambahan…", style = LocalAiTypography.composerInput, color = colors.secondaryText)
+                                        }
+                                        inner()
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            val instrSaved = instrDraft.trim() == vm.customInstructions.trim()
+                            Spacer(Modifier.height(8.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("${instrDraft.length}/${ContextBuilder.MAX_CUSTOM_INSTRUCTIONS}", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                Text(
+                                    if (instrSaved) "Tersimpan" else "Belum disimpan",
+                                    style = LocalAiTypography.metadata,
+                                    color = colors.secondaryText
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(2, 4, 6).forEach { v ->
-                                    OptionChip(v.toString(), cpuThreads == v, colors) { vm.updateCpuThreads(v) }
+                                OptionChip("Simpan", !instrSaved, colors) {
+                                    if (!instrSaved) vm.updateCustomInstructions(instrDraft.trim())
+                                }
+                                if (instrDraft.isNotEmpty() || vm.customInstructions.isNotEmpty()) {
+                                    OptionChip("Kosongkan", false, colors) {
+                                        instrDraft = ""
+                                        vm.updateCustomInstructions("")
+                                    }
                                 }
                             }
-                            Spacer(Modifier.height(12.dp))
-                            Text("Suhu (kreativitas)", style = LocalAiTypography.metadata, color = colors.secondaryText)
-                            Spacer(Modifier.height(6.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(0.3f, 0.6f, 0.9f).forEach { v ->
-                                    OptionChip(v.toString(), temperature == v, colors) { vm.updateTemperature(v) }
-                                }
-                            }
+
+                            Spacer(Modifier.height(28.dp))
+                            Text("Performa dan gaya jawaban", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "Perubahan dipakai pada pesan berikutnya; model dimuat ulang otomatis bila perlu.",
+                                style = LocalAiTypography.metadata,
+                                color = colors.secondaryText
+                            )
+                            Spacer(Modifier.height(16.dp))
+
+                            val cores = remember { Runtime.getRuntime().availableProcessors().coerceIn(4, 12) }
+                            val recommended = (cores / 2).coerceAtLeast(2)
+
+                            SettingSlider(
+                                title = "Panjang konteks",
+                                value = contextSize.toFloat().coerceIn(2048f, 8192f),
+                                range = 2048f..8192f,
+                                steps = 11,
+                                colors = colors,
+                                valueText = { "${it.roundToInt()} token" },
+                                caption = { "Sekitar ${(it * 0.7f / 10).toInt() * 10} kata percakapan yang diingat. Makin besar, makin banyak RAM dan makin lambat." },
+                                onCommit = { vm.updateContextSize(it.roundToInt()) }
+                            )
+                            Spacer(Modifier.height(20.dp))
+                            SettingSlider(
+                                title = "Thread CPU",
+                                value = cpuThreads.toFloat().coerceIn(1f, cores.toFloat()),
+                                range = 1f..cores.toFloat(),
+                                steps = cores - 2,
+                                colors = colors,
+                                valueText = { "${it.roundToInt()} thread" },
+                                caption = { "HP ini punya $cores core. Disarankan $recommended thread supaya tidak cepat panas." },
+                                onCommit = { vm.updateCpuThreads(it.roundToInt()) }
+                            )
+                            Spacer(Modifier.height(20.dp))
+                            SettingSlider(
+                                title = "Suhu (kreativitas)",
+                                value = temperature.coerceIn(0f, 1.5f),
+                                range = 0f..1.5f,
+                                steps = 29,
+                                colors = colors,
+                                valueText = { String.format(Locale("id", "ID"), "%.2f", it) },
+                                caption = {
+                                    when {
+                                        it < 0.2f -> "Sangat konsisten dan presisi, cocok untuk fakta dan kode."
+                                        it < 0.5f -> "Fokus dan akurat."
+                                        it < 0.9f -> "Seimbang untuk obrolan sehari-hari."
+                                        else -> "Kreatif, tetapi lebih sulit ditebak."
+                                    }
+                                },
+                                startLabel = "Presisi",
+                                endLabel = "Kreatif",
+                                onCommit = { vm.updateTemperature((it * 20).roundToInt() / 20f) }
+                            )
                             Spacer(Modifier.height(24.dp))
                         }
                     }
@@ -886,5 +1009,52 @@ private fun OptionChip(label: String, selected: Boolean, colors: LocalAiColors, 
             .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
         Text(label, fontSize = 14.sp, color = if (selected) colors.interactiveContent else colors.foreground)
+    }
+}
+
+@Composable
+private fun SettingSlider(
+    title: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    colors: LocalAiColors,
+    valueText: (Float) -> String,
+    caption: (Float) -> String,
+    onCommit: (Float) -> Unit,
+    startLabel: String? = null,
+    endLabel: String? = null
+) {
+    var drag by remember(value) { mutableFloatStateOf(value) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(title, style = LocalAiTypography.metadata, color = colors.secondaryText)
+            Text(valueText(drag), style = LocalAiTypography.headerModel, color = colors.foreground)
+        }
+        Slider(
+            value = drag,
+            onValueChange = { drag = it },
+            onValueChangeFinished = { onCommit(drag) },
+            valueRange = range,
+            steps = steps,
+            colors = SliderDefaults.colors(
+                thumbColor = colors.interactive,
+                activeTrackColor = colors.interactive,
+                inactiveTrackColor = colors.hairline,
+                activeTickColor = colors.interactiveContent.copy(alpha = 0.6f),
+                inactiveTickColor = colors.secondaryText.copy(alpha = 0.35f)
+            )
+        )
+        if (startLabel != null && endLabel != null) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(startLabel, style = LocalAiTypography.metadata, color = colors.secondaryText)
+                Text(endLabel, style = LocalAiTypography.metadata, color = colors.secondaryText)
+            }
+        }
+        Text(caption(drag), style = LocalAiTypography.metadata, color = colors.secondaryText)
     }
 }

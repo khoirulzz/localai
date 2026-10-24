@@ -57,6 +57,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var searchEnabled by mutableStateOf(false)
         private set
+    var customInstructions by mutableStateOf(prefs.getString(KEY_CUSTOM, ) ?: )
+        private set
 
     // ---- Percakapan -----------------------------------------------------------------------
     var conversations by mutableStateOf(listOf(blankConversation("conv-1")))
@@ -118,6 +120,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun pauseDownload(entry: ModelManifestEntry) = graph.models.pause(entry)
 
+    fun importModel(entry: ModelManifestEntry, uris: List<Uri>) = graph.models.importFiles(entry, uris)
+
     fun deleteModel(entry: ModelManifestEntry) {
         if (generationPhase != GenerationPhase.IDLE && activeModelId == entry.id) stop()
         viewModelScope.launch {
@@ -132,6 +136,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun updateCpuThreads(v: Int) { cpuThreads = v; prefs.edit().putInt(KEY_THREADS, v).apply() }
     fun updateTemperature(v: Float) { temperature = v; prefs.edit().putFloat(KEY_TEMP, v).apply() }
     fun updateSearchEnabled(v: Boolean) { searchEnabled = v }
+    fun updateCustomInstructions(v: String) {
+        customInstructions = v.take(ContextBuilder.MAX_CUSTOM_INSTRUCTIONS)
+        prefs.edit().putString(KEY_CUSTOM, customInstructions).apply()
+    }
     fun dismissNotice() { notice = null }
 
     // ===== Percakapan ========================================================================
@@ -330,7 +338,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val history = prior
                 .filter { (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank() }
                 .map { ChatTurn(if (it.isUser) MessageRole.USER else MessageRole.ASSISTANT, it.text) }
-            val turns = ContextBuilder.buildBoundedTurns(history, question, pdfChunks, web, contextSize)
+            val turns = ContextBuilder.buildBoundedTurns(history, question, pdfChunks, web, contextSize, customInstructions)
             val imagePath = if (attachment?.type == "image") attachment.localPath else null
             val citations = buildCitations(pdfChunks, web)
 
@@ -452,6 +460,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_CTX = "ctx"
         const val KEY_THREADS = "threads"
         const val KEY_TEMP = "temp"
+        const val KEY_CUSTOM = "custom_instructions"
         const val MAX_OUTPUT_TOKENS = 768
     }
 }
