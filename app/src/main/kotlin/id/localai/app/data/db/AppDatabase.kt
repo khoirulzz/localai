@@ -112,6 +112,13 @@ interface ChatDao {
         LIMIT :limit
     """)
     suspend fun searchPdfChunks(documentId: String, ftsQuery: String, limit: Int = 4): List<PdfChunkEntity>
+
+    /** Cadangan bila pertanyaan tidak punya kata kunci yang berguna (mis. "ringkas dokumen ini"). */
+    @Query("SELECT * FROM pdf_chunks WHERE documentId = :documentId ORDER BY pageNumber ASC, rowid ASC LIMIT :limit")
+    suspend fun getFirstChunks(documentId: String, limit: Int = 6): List<PdfChunkEntity>
+
+    @Query("DELETE FROM pdf_chunks WHERE documentId = :documentId")
+    suspend fun deletePdfChunks(documentId: String)
 }
 
 @Database(

@@ -28,6 +28,8 @@ object LlamaBridge {
         callback: NativeStreamCallback
     ): Int
 
+    external fun nativeSupportsVision(): Boolean
+
     external fun nativeCancel()
 
     external fun nativeUnload()

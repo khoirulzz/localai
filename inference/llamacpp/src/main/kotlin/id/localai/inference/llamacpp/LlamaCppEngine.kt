@@ -6,16 +6,19 @@ import id.localai.inference.api.*
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.channels.ProducerScope
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.coroutineContext
 
 class LlamaCppEngine(
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -31,6 +34,10 @@ class LlamaCppEngine(
     private val cancelRequested = AtomicBoolean(false)
     private var lastColdLoadMs: Long = 0L
 
+    /** True bila proyektor visi berhasil dimuat bersama model aktif. */
+    val supportsVision: Boolean
+        get() = _activeConfig.value != null && LlamaBridge.nativeSupportsVision()
+
     override suspend fun load(model: ModelConfig): Result<Long> = withContext(inferenceDispatcher) {
         val file = File(model.ggufPath)
         if (!file.exists()) {
@@ -40,12 +47,17 @@ class LlamaCppEngine(
 
         _state.value = EngineState.LOADING
         val startMs = SystemClock.elapsedRealtime()
-        val ok = LlamaBridge.nativeLoadModel(
-            ggufPath = model.ggufPath,
-            projectorPath = model.projectorPath,
-            contextTokens = model.contextTokens,
-            cpuThreads = model.cpuThreads
-        )
+        val ok = try {
+            LlamaBridge.nativeLoadModel(
+                ggufPath = model.ggufPath,
+                projectorPath = model.projectorPath?.takeIf { File(it).exists() },
+                contextTokens = model.contextTokens,
+                cpuThreads = model.cpuThreads
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            _state.value = EngineState.UNLOADED
+            return@withContext Result.failure(IllegalStateException("Pustaka native llama.cpp tidak termuat di perangkat ini."))
+        }
         val elapsed = SystemClock.elapsedRealtime() - startMs
 
         if (ok) {
@@ -60,105 +72,95 @@ class LlamaCppEngine(
         }
     }
 
-    override fun generate(request: InferenceRequest): Flow<InferenceEvent> = callbackFlow {
+    override fun generate(request: InferenceRequest): Flow<InferenceEvent> = channelFlow {
         val config = _activeConfig.value
         if (config == null || _state.value == EngineState.UNLOADED) {
-            trySend(InferenceEvent.Failed("Model belum dimuat ke memori."))
-            close()
-            return@callbackFlow
+            send(InferenceEvent.Failed("Model belum dimuat ke memori."))
+            return@channelFlow
+        }
+        if (request.imagePath != null && !LlamaBridge.nativeSupportsVision()) {
+            send(InferenceEvent.Failed("Model aktif belum memuat proyektor visi, jadi belum bisa membaca gambar."))
+            return@channelFlow
         }
 
         cancelRequested.set(false)
+        val producerJob = coroutineContext.job
         _state.value = EngineState.PREPARING
-        trySend(InferenceEvent.Preparing)
-
+        send(InferenceEvent.Preparing)
         if (request.imagePath != null) {
             _state.value = EngineState.VISION_ENCODING
-            trySend(InferenceEvent.VisionEncoding)
+            send(InferenceEvent.VisionEncoding)
         }
 
-        val formattedPrompt = formatChatMlPrompt(request.messages)
+        val formattedPrompt = formatPrompt(config.promptFormat, request.messages, withImage = request.imagePath != null)
         val prefillTokenEstimate = (formattedPrompt.length / 4).coerceAtLeast(1)
         val startMs = SystemClock.elapsedRealtime()
         var firstTokenMs = 0L
-        var emittedTokens = 0
+        var emittedPieces = 0
         val fullBuilder = StringBuilder()
+        val outer: ProducerScope<InferenceEvent> = this
 
-        // Coalescing buffer 40ms sesuai DESIGN.md bagian 5.4
+        // Coalescing 40 ms (DESIGN.md 5.4): satu event per jendela, bukan per token.
         val pendingChunk = StringBuilder()
         var lastFlushMs = SystemClock.elapsedRealtime()
 
-        _state.value = EngineState.GENERATING
-
-        val status = LlamaBridge.nativeGenerateStream(
-            formattedPrompt = formattedPrompt,
-            imagePath = request.imagePath,
-            maxOutputTokens = request.maxOutputTokens,
-            temperature = request.temperature,
-            callback = object : NativeStreamCallback {
-                override fun onTokenPiece(piece: String): Boolean {
-                    if (cancelRequested.get()) return false
-                    val now = SystemClock.elapsedRealtime()
-                    if (firstTokenMs == 0L) {
-                        firstTokenMs = (now - startMs).coerceAtLeast(1L)
+        val status = withContext(inferenceDispatcher) {
+            _state.value = EngineState.GENERATING
+            LlamaBridge.nativeGenerateStream(
+                formattedPrompt = formattedPrompt,
+                imagePath = request.imagePath,
+                maxOutputTokens = request.maxOutputTokens,
+                temperature = request.temperature,
+                callback = object : NativeStreamCallback {
+                    override fun onTokenPiece(piece: String): Boolean {
+                        if (cancelRequested.get() || !producerJob.isActive) return false
+                        val now = SystemClock.elapsedRealtime()
+                        if (firstTokenMs == 0L) firstTokenMs = (now - startMs).coerceAtLeast(1L)
+                        emittedPieces++
+                        fullBuilder.append(piece)
+                        pendingChunk.append(piece)
+                        if (now - lastFlushMs >= 40L) {
+                            outer.trySend(InferenceEvent.TextDelta(pendingChunk.toString()))
+                            pendingChunk.clear()
+                            lastFlushMs = now
+                        }
+                        return true
                     }
-                    emittedTokens++
-                    fullBuilder.append(piece)
-                    pendingChunk.append(piece)
-
-                    if (now - lastFlushMs >= 40L) {
-                        trySend(InferenceEvent.TextDelta(pendingChunk.toString()))
-                        pendingChunk.clear()
-                        lastFlushMs = now
-                    }
-                    return !cancelRequested.get()
                 }
-            }
-        )
+            )
+        }
 
         if (pendingChunk.isNotEmpty()) {
-            trySend(InferenceEvent.TextDelta(pendingChunk.toString()))
+            send(InferenceEvent.TextDelta(pendingChunk.toString()))
             pendingChunk.clear()
         }
 
         val totalMs = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
         val ttft = if (firstTokenMs > 0L) firstTokenMs else totalMs
         val decodeDurationSec = ((totalMs - ttft).coerceAtLeast(1L)) / 1000f
-        val prefillDurationSec = (ttft.coerceAtLeast(1L)) / 1000f
-        val pssMb = (Debug.getPss() / 1024).toInt()
-
+        val decodeTokens = if (status >= 0) status else emittedPieces
         val stats = RunStats(
             modelId = config.id,
             coldLoadMs = lastColdLoadMs,
             ttftMs = ttft,
             prefillTokens = prefillTokenEstimate,
-            decodeTokens = emittedTokens,
-            prefillTokPerSec = prefillTokenEstimate / prefillDurationSec,
-            decodeTokPerSec = emittedTokens / decodeDurationSec,
-            peakPssMb = pssMb,
+            decodeTokens = decodeTokens,
+            prefillTokPerSec = prefillTokenEstimate / (ttft / 1000f),
+            decodeTokPerSec = decodeTokens / decodeDurationSec,
+            peakPssMb = (Debug.getPss() / 1024).toInt(),
             cpuThreads = config.cpuThreads,
             contextTokens = config.contextTokens
         )
 
-        _state.value = EngineState.READY
+        _state.value = if (_activeConfig.value != null) EngineState.READY else EngineState.UNLOADED
 
         when {
-            cancelRequested.get() || status == -99 -> {
-                trySend(InferenceEvent.Stopped(fullBuilder.toString(), stats))
-            }
-            status < 0 -> {
-                trySend(InferenceEvent.Failed("Decoding dihentikan karena batas memori atau konteks penuh."))
-            }
-            else -> {
-                trySend(InferenceEvent.Completed(stats))
-            }
+            cancelRequested.get() || status == STATUS_ABORTED || !producerJob.isActive ->
+                send(InferenceEvent.Stopped(fullBuilder.toString(), stats))
+            status < 0 -> send(InferenceEvent.Failed(describeFailure(status)))
+            else -> send(InferenceEvent.Completed(stats))
         }
-
-        close()
-        awaitClose {
-            LlamaBridge.nativeCancel()
-        }
-    }.flowOn(inferenceDispatcher)
+    }.buffer(Channel.UNLIMITED)
 
     override suspend fun cancel() {
         cancelRequested.set(true)
@@ -172,22 +174,62 @@ class LlamaCppEngine(
         _state.value = EngineState.UNLOADED
     }
 
-    /**
-     * Format ChatML Qwen3.5 non-thinking default sesuai PRD & ARCHITECTURE bagian 5.
-     */
-    private fun formatChatMlPrompt(messages: List<ChatTurn>): String {
-        val sb = StringBuilder()
-        for (turn in messages) {
-            val roleTag = when (turn.role) {
-                MessageRole.SYSTEM -> "system"
-                MessageRole.USER -> "user"
-                MessageRole.ASSISTANT -> "assistant"
+    private fun describeFailure(status: Int): String = when (status) {
+        -1 -> "Model belum dimuat ke memori."
+        -3 -> "Konteks penuh. Mulai percakapan baru atau perbesar ukuran konteks di Pengaturan."
+        -4 -> "Proses decoding gagal. Memori perangkat mungkin tidak cukup untuk model ini."
+        -5 -> "Teks tidak dapat diproses oleh tokenizer model."
+        -6 -> "Gambar tidak dapat diproses oleh model ini."
+        else -> "Generasi dihentikan karena kesalahan native (kode $status)."
+    }
+
+    companion object {
+        private const val STATUS_ABORTED = -99
+
+        /** Penanda media yang diganti mtmd dengan token gambar. */
+        private const val MEDIA_MARKER = "<__media__>"
+
+        /**
+         * Susun prompt sesuai template chat tiap keluarga model, dalam mode non-thinking
+         * supaya model kecil tidak masuk loop berpikir. Gambar (jika ada) menempel pada
+         * giliran pengguna terakhir.
+         */
+        internal fun formatPrompt(format: PromptFormat, messages: List<ChatTurn>, withImage: Boolean): String {
+            val lastUserIndex = messages.indexOfLast { it.role == MessageRole.USER }
+            fun contentOf(index: Int, turn: ChatTurn): String {
+                val text = turn.content.trim()
+                return if (withImage && index == lastUserIndex) "$MEDIA_MARKER\n$text" else text
             }
-            sb.append("<|im_start|>").append(roleTag).append("\n")
-            sb.append(turn.content.trim()).append("<|im_end|>\n")
+
+            val sb = StringBuilder()
+            when (format) {
+                PromptFormat.CHATML_QWEN -> {
+                    messages.forEachIndexed { i, turn ->
+                        val tag = when (turn.role) {
+                            MessageRole.SYSTEM -> "system"
+                            MessageRole.USER -> "user"
+                            MessageRole.ASSISTANT -> "assistant"
+                        }
+                        sb.append("<|im_start|>").append(tag).append('\n')
+                        sb.append(contentOf(i, turn)).append("<|im_end|>\n")
+                    }
+                    sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                }
+                PromptFormat.GEMMA4 -> {
+                    sb.append("<bos>")
+                    messages.forEachIndexed { i, turn ->
+                        val tag = when (turn.role) {
+                            MessageRole.SYSTEM -> "system"
+                            MessageRole.USER -> "user"
+                            MessageRole.ASSISTANT -> "model"
+                        }
+                        sb.append("<|turn>").append(tag).append('\n')
+                        sb.append(contentOf(i, turn)).append("<turn|>\n")
+                    }
+                    sb.append("<|turn>model\n<|channel>thought\n<channel|>")
+                }
+            }
+            return sb.toString()
         }
-        // Non-thinking default: langsung tutup blok think kosong agar model 2B tidak masuk thinking loop
-        sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-        return sb.toString()
     }
 }

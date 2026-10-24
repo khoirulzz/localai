@@ -33,14 +33,13 @@ jobs:
           "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
 
       - name: Clone llama.cpp (for native build)
+        env:
+          # Tag di-pin: API C llama.cpp sering berubah, jadi jangan ikut master.
+          LLAMA_CPP_TAG: b11854
         run: |
-          git clone --depth 1 --branch b4600 https://github.com/ggerganov/llama.cpp.git inference/llamacpp/src/main/cpp/llama.cpp
-          # Fallback if tag missing
-          if [ ! -f inference/llamacpp/src/main/cpp/llama.cpp/CMakeLists.txt ]; then
-            rm -rf inference/llamacpp/src/main/cpp/llama.cpp
-            git clone --depth 1 https://github.com/ggerganov/llama.cpp.git inference/llamacpp/src/main/cpp/llama.cpp
-          fi
-          ls inference/llamacpp/src/main/cpp/llama.cpp/CMakeLists.txt
+          git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git inference/llamacpp/src/main/cpp/llama.cpp
+          test -f inference/llamacpp/src/main/cpp/llama.cpp/CMakeLists.txt
+          test -f inference/llamacpp/src/main/cpp/llama.cpp/tools/mtmd/CMakeLists.txt
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew

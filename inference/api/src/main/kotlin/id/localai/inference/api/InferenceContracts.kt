@@ -23,10 +23,20 @@ data class ChatTurn(
     val content: String
 )
 
+/** Format prompt yang dipakai model. Tiap keluarga model punya token giliran bicara sendiri. */
+enum class PromptFormat {
+    /** Qwen3 / Qwen3.5: ChatML dengan blok think kosong (mode non-thinking). */
+    CHATML_QWEN,
+
+    /** Gemma 4: `<|turn>role ... <turn|>` dengan kanal thought kosong. */
+    GEMMA4
+}
+
 data class ModelConfig(
     val id: String,
     val ggufPath: String,
     val projectorPath: String? = null,
+    val promptFormat: PromptFormat = PromptFormat.CHATML_QWEN,
     val contextTokens: Int = 2048,
     val cpuThreads: Int = 4
 )
