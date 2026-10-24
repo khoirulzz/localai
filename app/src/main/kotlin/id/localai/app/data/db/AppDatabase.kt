@@ -8,7 +8,10 @@ data class ConversationEntity(
     @PrimaryKey val id: String,
     val title: String,
     val activeModelId: String,
-    val updatedAtMs: Long
+    val updatedAtMs: Long,
+    val summary: String = "",
+    val summarizedThroughMs: Long = 0L,
+    val activeDocumentId: String? = null
 )
 
 @Entity(
@@ -33,6 +36,10 @@ data class MessageEntity(
     val attachmentPages: Int? = null,
     val status: String = "COMPLETED", // "STREAMING" | "COMPLETED" | "STOPPED" | "FAILED"
     val errorText: String? = null,
+    val thinking: String = "",
+    val generatedTokens: Int = 0,
+    val elapsedMs: Long = 0L,
+    val tokensPerSecond: Float = 0f,
     val createdAtMs: Long
 )
 
@@ -129,7 +136,7 @@ interface ChatDao {
         PdfChunkEntity::class,
         PdfChunkFtsEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
