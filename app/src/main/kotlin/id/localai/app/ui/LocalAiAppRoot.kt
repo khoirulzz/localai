@@ -5,6 +5,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.compose.ui.platform.LocalContext
+import id.localai.app.search.TavilyKeyStore
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -84,7 +93,10 @@ fun LocalAiAppRoot() {
     val scope = rememberCoroutineScope()
 
     var currentScreen by remember { mutableStateOf(ActiveScreen.CHAT) }
-    var drawerOpen by remember { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val context = LocalContext.current
+    val keyStore = remember { TavilyKeyStore(context) }
+    var keyInput by remember { mutableStateOf("") }
     var showModelPicker by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
 
@@ -98,8 +110,8 @@ fun LocalAiAppRoot() {
     }
 
     // Tavily BYOK Settings state
-    var savedTavilyKey by remember { mutableStateOf("") }
-    var tavilyStatus by remember { mutableStateOf("API key belum disimpan") }
+    var savedTavilyKey by remember { mutableStateOf(if (runCatching { keyStore.hasSavedKey() }.getOrDefault(false)) "saved" else "") }
+    var tavilyStatus by remember { mutableStateOf(if (savedTavilyKey.isNotBlank()) "API key tersimpan (terenkripsi)" else "API key belum disimpan") }
     var searchEnabled by remember { mutableStateOf(false) }
 
     // Advanced Settings state
@@ -126,12 +138,107 @@ fun LocalAiAppRoot() {
     var pendingAttachment by remember { mutableStateOf<UiAttachment?>(null) }
     var generationPhase by remember { mutableStateOf(GenerationPhase.IDLE) }
 
+    val startNewConversation = {
+        val newId = "conv-${System.currentTimeMillis()}"
+        conversations = listOf(UiConversation(newId, "Percakapan baru", emptyList())) + conversations
+        activeConvId = newId
+        composerText = ""
+        pendingAttachment = null
+        searchEnabled = false
+    }
+    val displayNameOf: (Uri) -> String = { uri ->
+        runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) it.getString(0) else null
+            }
+        }.getOrNull() ?: "lampiran"
+    }
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) pendingAttachment = UiAttachment(displayNameOf(uri), "image", "Foto")
+    }
+    val pickPdf = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) pendingAttachment = UiAttachment(displayNameOf(uri), "pdf", "PDF")
+    }
+
+    BackHandler(enabled = drawerState.isOpen || currentScreen != ActiveScreen.CHAT) {
+        if (drawerState.isOpen) scope.launch { drawerState.close() } else currentScreen = ActiveScreen.CHAT
+    }
+
     CompositionLocalProvider(LocalAppColors provides colors) {
         Surface(
             modifier = Modifier.fillMaxSize(),
             color = colors.background,
             contentColor = colors.foreground
         ) {
+            ModalNavigationDrawer(
+                drawerState = drawerState,
+                gesturesEnabled = currentScreen == ActiveScreen.CHAT,
+                drawerContent = {
+                    ModalDrawerSheet(
+                        drawerContainerColor = colors.background,
+                        drawerContentColor = colors.foreground
+                    ) {
+                        Column(modifier = Modifier.fillMaxHeight().padding(16.dp)) {
+                            Text("Local AI", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Spacer(Modifier.height(12.dp))
+                            DrawerRow("✎  Percakapan baru", colors) {
+                                startNewConversation()
+                                currentScreen = ActiveScreen.CHAT
+                                scope.launch { drawerState.close() }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Text("Riwayat", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                items(conversations, key = { it.id }) { c ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                activeConvId = c.id
+                                                currentScreen = ActiveScreen.CHAT
+                                                scope.launch { drawerState.close() }
+                                            }
+                                            .padding(vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = c.title.ifBlank { "Percakapan baru" },
+                                            color = if (c.id == activeConvId) colors.foreground else colors.secondaryText,
+                                            fontWeight = if (c.id == activeConvId) FontWeight.Medium else FontWeight.Normal,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Text(
+                                            text = "Hapus",
+                                            style = LocalAiTypography.metadata,
+                                            color = colors.secondaryText,
+                                            modifier = Modifier
+                                                .clickable {
+                                                    val remaining = conversations.filter { it.id != c.id }
+                                                    conversations = remaining.ifEmpty {
+                                                        listOf(UiConversation("conv-${System.currentTimeMillis()}", "Percakapan baru", emptyList()))
+                                                    }
+                                                    if (activeConvId == c.id) activeConvId = conversations.first().id
+                                                }
+                                                .padding(start = 12.dp, top = 8.dp, bottom = 8.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            DrawerRow("Kelola model", colors) {
+                                currentScreen = ActiveScreen.MODEL_MANAGER
+                                scope.launch { drawerState.close() }
+                            }
+                            DrawerRow("Pengaturan", colors) {
+                                currentScreen = ActiveScreen.SETTINGS
+                                scope.launch { drawerState.close() }
+                            }
+                        }
+                    }
+                }
+            ) {
             Box(modifier = Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
                 when (currentScreen) {
                     ActiveScreen.CHAT -> {
@@ -148,7 +255,7 @@ fun LocalAiAppRoot() {
                                 Box(
                                     modifier = Modifier
                                         .size(LocalAiDimens.MinTouchTarget)
-                                        .clickable { drawerOpen = true }
+                                        .clickable { scope.launch { drawerState.open() } }
                                         .semantics { contentDescription = "Buka riwayat percakapan" },
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -505,7 +612,12 @@ fun LocalAiAppRoot() {
                     }
 
                     ActiveScreen.SETTINGS -> {
-                        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(16.dp)
+                        ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = "← Kembali",
@@ -515,7 +627,17 @@ fun LocalAiAppRoot() {
                                 Spacer(Modifier.width(12.dp))
                                 Text("Pengaturan", style = LocalAiTypography.headerModel, color = colors.foreground)
                             }
+
                             Spacer(Modifier.height(20.dp))
+                            Text("Tampilan", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OptionChip("Sistem", themeMode == ThemeMode.SYSTEM, colors) { themeMode = ThemeMode.SYSTEM }
+                                OptionChip("Terang", themeMode == ThemeMode.LIGHT, colors) { themeMode = ThemeMode.LIGHT }
+                                OptionChip("Gelap", themeMode == ThemeMode.DARK, colors) { themeMode = ThemeMode.DARK }
+                            }
+
+                            Spacer(Modifier.height(28.dp))
                             Text("Web Search", style = LocalAiTypography.headerModel, color = colors.foreground)
                             Spacer(Modifier.height(8.dp))
                             Text(
@@ -525,10 +647,179 @@ fun LocalAiAppRoot() {
                             )
                             Spacer(Modifier.height(8.dp))
                             Text("Status: $tavilyStatus", style = LocalAiTypography.metadata, color = colors.foreground)
+                            Spacer(Modifier.height(12.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(colors.inputSurface)
+                                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                            ) {
+                                BasicTextField(
+                                    value = keyInput,
+                                    onValueChange = { keyInput = it },
+                                    singleLine = true,
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    textStyle = LocalAiTypography.composerInput.copy(color = colors.foreground),
+                                    cursorBrush = SolidColor(colors.foreground),
+                                    decorationBox = { inner ->
+                                        if (keyInput.isEmpty()) {
+                                            Text("Tempel API key Tavily", style = LocalAiTypography.composerInput, color = colors.secondaryText)
+                                        }
+                                        inner()
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OptionChip("Simpan", keyInput.isNotBlank(), colors) {
+                                    if (keyInput.isNotBlank()) {
+                                        try {
+                                            keyStore.saveApiKey(keyInput)
+                                            savedTavilyKey = "saved"
+                                            tavilyStatus = "API key tersimpan (terenkripsi)"
+                                            keyInput = ""
+                                        } catch (e: Exception) {
+                                            tavilyStatus = "Gagal menyimpan: ${e.message}"
+                                        }
+                                    }
+                                }
+                                if (savedTavilyKey.isNotBlank()) {
+                                    OptionChip("Hapus key", false, colors) {
+                                        runCatching { keyStore.clearApiKey() }
+                                        savedTavilyKey = ""
+                                        searchEnabled = false
+                                        tavilyStatus = "API key belum disimpan"
+                                    }
+                                }
+                            }
+
+                            Spacer(Modifier.height(28.dp))
+                            Text("Lanjutan", style = LocalAiTypography.headerModel, color = colors.foreground)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Ukuran konteks (token)", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf(1024, 2048, 4096).forEach { v ->
+                                    OptionChip(v.toString(), contextSize == v, colors) { contextSize = v }
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Text("Thread CPU", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf(2, 4, 6).forEach { v ->
+                                    OptionChip(v.toString(), cpuThreads == v, colors) { cpuThreads = v }
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Text("Suhu (kreativitas)", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf(0.3f, 0.6f, 0.9f).forEach { v ->
+                                    OptionChip(v.toString(), temperature == v, colors) { temperature = v }
+                                }
+                            }
+                            Spacer(Modifier.height(24.dp))
                         }
                     }
                 }
             }
+            }
+
+            // Sheet pilih model
+            if (showModelPicker) {
+                ModalBottomSheet(
+                    onDismissRequest = { showModelPicker = false },
+                    containerColor = colors.inputSurface,
+                    contentColor = colors.foreground
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
+                        Text("Pilih model", style = LocalAiTypography.headerModel, color = colors.foreground)
+                        Spacer(Modifier.height(8.dp))
+                        ModelCatalog.entries.filter { installedModelIds.contains(it.id) }.forEach { e ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { activeModelId = e.id; showModelPicker = false }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(e.displayName, color = colors.foreground)
+                                    Text(e.roleSummary, style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                }
+                                if (e.id == activeModelId) Text("✓", color = colors.foreground)
+                            }
+                        }
+                        Text(
+                            "Kelola model",
+                            color = colors.foreground,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showModelPicker = false; currentScreen = ActiveScreen.MODEL_MANAGER }
+                                .padding(vertical = 12.dp)
+                        )
+                    }
+                }
+            }
+
+            // Sheet lampiran
+            if (showAttachmentSheet) {
+                ModalBottomSheet(
+                    onDismissRequest = { showAttachmentSheet = false },
+                    containerColor = colors.inputSurface,
+                    contentColor = colors.foreground
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
+                        Text("Tambah lampiran", style = LocalAiTypography.headerModel, color = colors.foreground)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Foto",
+                            color = colors.foreground,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showAttachmentSheet = false; pickImage.launch("image/*") }
+                                .padding(vertical = 14.dp)
+                        )
+                        Text(
+                            "PDF",
+                            color = colors.foreground,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showAttachmentSheet = false; pickPdf.launch("application/pdf") }
+                                .padding(vertical = 14.dp)
+                        )
+                    }
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun DrawerRow(label: String, colors: LocalAiColors, onClick: () -> Unit) {
+    Text(
+        text = label,
+        color = colors.foreground,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 14.dp)
+    )
+}
+
+@Composable
+private fun OptionChip(label: String, selected: Boolean, colors: LocalAiColors, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (selected) colors.interactive else colors.background.copy(alpha = 0f))
+            .border(1.dp, if (selected) colors.interactive else colors.hairline, RoundedCornerShape(18.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Text(label, fontSize = 14.sp, color = if (selected) colors.interactiveContent else colors.foreground)
     }
 }
