@@ -60,11 +60,17 @@ jobs:
         run: |
           echo "::notice title=APK::$(find app/build -name '*.apk' 2>/dev/null | tr '\n' ' ') | $(ls app/build/outputs 2>&1 | tr '\n' ' ')"
 
+      - name: Package update ZIP
+        run: |
+          zip -j Nalaro-AI-v0.4.1-APK.zip app/build/outputs/apk/debug/app-debug.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: local-ai-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            Nalaro-AI-v0.4.1-APK.zip
           if-no-files-found: error
           retention-days: 14
 
