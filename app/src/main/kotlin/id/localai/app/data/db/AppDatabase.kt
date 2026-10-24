@@ -69,7 +69,7 @@ data class PdfChunkEntity(
 @Fts4(contentEntity = PdfChunkEntity::class)
 @Entity(tableName = "pdf_chunks_fts")
 data class PdfChunkFtsEntity(
-    @ColumnInfo(name = "rowid") val rowId: Int,
+    @PrimaryKey @ColumnInfo(name = "rowid") val rowId: Int,
     val content: String
 )
 
