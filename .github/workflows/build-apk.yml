@@ -3,6 +3,8 @@ name: Build APK
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -79,10 +81,11 @@ jobs:
           find app/build/outputs -name "*.apk" -exec ls -lh {} \;
 
       - name: Publish GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk local-ai-debug.apk
-          gh release create "build-${{ github.run_number }}" local-ai-debug.apk \
+          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.1-APK.zip \
             --title "Debug build #${{ github.run_number }}" \
             --notes "Debug APK (arm64-v8a), commit ${{ github.sha }}" --prerelease
