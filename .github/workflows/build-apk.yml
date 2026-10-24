@@ -55,11 +55,15 @@ jobs:
           grep -nE "^e: |error:|FAILED|What went wrong|Execution failed|Caused by|CMake Error|undefined reference" -A2 build.log | head -40 > err.txt || true
           echo "::error title=Gradle::$(sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g' err.txt | cut -c1-3500)"
 
+      - name: Lokasi APK
+        run: |
+          echo "::notice title=APK::$(find app/build -name '*.apk' 2>/dev/null | tr '\n' ' ') | $(ls app/build/outputs 2>&1 | tr '\n' ' ')"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: local-ai-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/**/*.apk
           if-no-files-found: error
           retention-days: 14
 
