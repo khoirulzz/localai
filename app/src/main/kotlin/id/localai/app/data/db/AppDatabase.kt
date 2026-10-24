@@ -88,7 +88,8 @@ interface ChatDao {
     @Query("SELECT * FROM conversations WHERE title LIKE '%' || :query || '%' ORDER BY updatedAtMs DESC")
     suspend fun searchConversations(query: String): List<ConversationEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // Hindari REPLACE di parent: SQLite REPLACE memicu DELETE + FK CASCADE pada messages.
+    @Upsert
     suspend fun upsertConversation(conversation: ConversationEntity)
 
     @Query("DELETE FROM conversations WHERE id = :conversationId")
@@ -97,7 +98,7 @@ interface ChatDao {
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAtMs ASC")
     fun observeMessages(conversationId: String): Flow<List<MessageEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertMessage(message: MessageEntity)
 
     @Query("DELETE FROM messages WHERE conversationId = :conversationId AND createdAtMs >= :fromTimestampMs")
