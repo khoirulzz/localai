@@ -57,7 +57,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var searchEnabled by mutableStateOf(false)
         private set
-    var customInstructions by mutableStateOf(prefs.getString(KEY_CUSTOM, ) ?: )
+    var customInstructions by mutableStateOf(prefs.getString(KEY_CUSTOM, "") ?: "")
         private set
 
     // ---- Percakapan -----------------------------------------------------------------------
