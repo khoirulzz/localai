@@ -8,7 +8,10 @@ data class ConversationEntity(
     @PrimaryKey val id: String,
     val title: String,
     val activeModelId: String,
-    val updatedAtMs: Long
+    val updatedAtMs: Long,
+    val summary: String = "",
+    val summarizedThroughMs: Long = 0L,
+    val activeDocumentId: String? = null
 )
 
 @Entity(
@@ -33,6 +36,10 @@ data class MessageEntity(
     val attachmentPages: Int? = null,
     val status: String = "COMPLETED", // "STREAMING" | "COMPLETED" | "STOPPED" | "FAILED"
     val errorText: String? = null,
+    val thinking: String = "",
+    val generatedTokens: Int = 0,
+    val elapsedMs: Long = 0L,
+    val tokensPerSecond: Float = 0f,
     val createdAtMs: Long
 )
 
@@ -81,7 +88,8 @@ interface ChatDao {
     @Query("SELECT * FROM conversations WHERE title LIKE '%' || :query || '%' ORDER BY updatedAtMs DESC")
     suspend fun searchConversations(query: String): List<ConversationEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // Hindari REPLACE di parent: SQLite REPLACE memicu DELETE + FK CASCADE pada messages.
+    @Upsert
     suspend fun upsertConversation(conversation: ConversationEntity)
 
     @Query("DELETE FROM conversations WHERE id = :conversationId")
@@ -90,7 +98,7 @@ interface ChatDao {
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAtMs ASC")
     fun observeMessages(conversationId: String): Flow<List<MessageEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertMessage(message: MessageEntity)
 
     @Query("DELETE FROM messages WHERE conversationId = :conversationId AND createdAtMs >= :fromTimestampMs")
@@ -129,7 +137,7 @@ interface ChatDao {
         PdfChunkEntity::class,
         PdfChunkFtsEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

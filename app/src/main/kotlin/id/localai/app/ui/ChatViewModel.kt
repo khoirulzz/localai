@@ -9,6 +9,9 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import id.localai.app.LocalAiApp
+import id.localai.app.data.db.ConversationEntity
+import id.localai.app.data.db.MessageEntity
+import id.localai.app.data.db.CitationEntity
 import id.localai.app.attachments.PdfImportResult
 import id.localai.app.data.db.PdfChunkEntity
 import id.localai.app.models.DownloadUi
@@ -21,17 +24,22 @@ import id.localai.inference.api.ChatTurn
 import id.localai.inference.api.InferenceEvent
 import id.localai.inference.api.InferenceRequest
 import id.localai.inference.api.MessageRole
+import id.localai.inference.api.PromptFormat
+import id.localai.inference.api.RunStats
 import id.localai.inference.api.ModelConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
  * Menghubungkan UI dengan mesin llama.cpp, unduhan model, dan pemrosesan lampiran.
- * State percakapan masih di memori (belum disimpan ke Room), seperti sebelumnya.
+ * Riwayat dan ringkasan persisten di Room, dengan inferensi lokal per percakapan.
  */
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -44,6 +52,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     var activeModelId by mutableStateOf<String?>(prefs.getString(KEY_ACTIVE_MODEL, null))
         private set
+
+    var thinkingMode by mutableStateOf(prefs.getString("think_${activeModelId}", "OFF") ?: "OFF")
+        private set
+    fun updateThinkingMode(mode: String) {
+        if (mode !in setOf("OFF", "STANDARD", "DEEP")) return
+        thinkingMode = mode
+        prefs.edit().putString("think_${activeModelId}", mode).apply()
+    }
 
     val activeEntry: ModelManifestEntry?
         get() = ModelCatalog.byId(activeModelId)?.takeIf { installedModelIds.value.contains(it.id) }
@@ -65,6 +81,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var activeConvId by mutableStateOf("conv-1")
         private set
+    var historyReady by mutableStateOf(false)
+        private set
+    private val persistenceMutex = Mutex()
 
     val currentConversation: UiConversation
         get() = conversations.firstOrNull { it.id == activeConvId } ?: conversations.first()
@@ -95,6 +114,48 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var stopRequested = false
 
     init {
+        // Restore dilakukan di background agar halaman segera tampil.
+        viewModelScope.launch {
+            try {
+                val restored = withContext(Dispatchers.IO) {
+                    val dao = graph.database.chatDao()
+                    dao.observeConversations().first().map { row ->
+                        UiConversation(
+                            id = row.id,
+                            title = row.title,
+                            documentId = row.activeDocumentId,
+                            summary = row.summary,
+                            summarizedThroughMs = row.summarizedThroughMs,
+                            messages = dao.observeMessages(row.id).first().map { m ->
+                                UiMessage(
+                                    id = m.id, isUser = m.role == "user", text = m.content,
+                                    attachment = m.attachmentName?.let {
+                                        UiAttachment(it, m.attachmentType ?: "pdf", "")
+                                    },
+                                    citations = dao.getCitationsForMessage(m.id).map {
+                                        UiCitation(it.title, it.urlOrPage, it.sourceType == "WEB")
+                                    },
+                                    status = if (m.status == "STREAMING") "STOPPED" else m.status,
+                                    errorText = m.errorText,
+                                    thinking = m.thinking, generatedTokens = m.generatedTokens,
+                                    elapsedMs = m.elapsedMs, tokensPerSecond = m.tokensPerSecond,
+                                    createdAtMs = m.createdAtMs
+                                )
+                            }
+                        )
+                    }
+                }
+                if (restored.isNotEmpty()) {
+                    conversations = restored
+                    activeConvId = prefs.getString(KEY_ACTIVE_CONV, null)
+                        ?.takeIf { id -> restored.any { it.id == id } } ?: restored.first().id
+                }
+            } catch (e: Exception) {
+                notice = "Riwayat tidak dapat dimuat: ${e.message}"
+            } finally {
+                historyReady = true
+            }
+        }
         // Pilih otomatis model terpasang bila belum ada yang aktif, dan lepas model yang sudah dihapus.
         viewModelScope.launch {
             graph.models.installed.collect { ids ->
@@ -113,6 +174,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun setActiveModel(id: String?) {
         activeModelId = id
+        thinkingMode = prefs.getString("think_${id}", "OFF") ?: "OFF"
         prefs.edit().putString(KEY_ACTIVE_MODEL, id).apply()
     }
 
@@ -145,10 +207,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ===== Percakapan ========================================================================
 
     fun newConversation() {
+        if (!historyReady) return
         if (generationPhase != GenerationPhase.IDLE) stop()
         val c = blankConversation("conv-${System.currentTimeMillis()}")
         conversations = listOf(c) + conversations
         activeConvId = c.id
+        prefs.edit().putString(KEY_ACTIVE_CONV, c.id).apply()
+        persistConversation(c.id)
         pendingAttachment = null
         notice = null
         searchEnabled = false
@@ -157,17 +222,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun selectConversation(id: String) {
         if (id != activeConvId && generationPhase != GenerationPhase.IDLE) stop()
         activeConvId = id
+        prefs.edit().putString(KEY_ACTIVE_CONV, id).apply()
+        pendingAttachment = null
         notice = null
     }
 
     fun deleteConversation(id: String) {
+        if (!historyReady) return
         if (id == activeConvId && generationPhase != GenerationPhase.IDLE) stop()
         val removed = conversations.firstOrNull { it.id == id }
         val remaining = conversations.filter { it.id != id }
         conversations = remaining.ifEmpty { listOf(blankConversation("conv-${System.currentTimeMillis()}")) }
         if (activeConvId == id) activeConvId = conversations.first().id
-        removed?.documentId?.let { docId ->
-            viewModelScope.launch(Dispatchers.IO) { runCatching { graph.database.chatDao().deletePdfChunks(docId) } }
+        prefs.edit().putString(KEY_ACTIVE_CONV, activeConvId).apply()
+        viewModelScope.launch(Dispatchers.IO) {
+            persistenceMutex.withLock {
+                graph.database.chatDao().deleteConversation(id)
+                removed?.documentId?.let { graph.database.chatDao().deletePdfChunks(it) }
+            }
+        }
+        if (conversations.size == 1 && conversations.first().messages.isEmpty()) {
+            persistConversation(conversations.first().id)
         }
     }
 
@@ -247,6 +322,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ===== Kirim & hentikan ==================================================================
 
     fun send(rawText: String) {
+        if (!historyReady) return
         if (generationPhase != GenerationPhase.IDLE) return
         val entry = activeEntry ?: return
         val att = pendingAttachment
@@ -269,10 +345,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 title = if (c.messages.isEmpty()) question.take(36) else c.title,
                 documentId = documentId,
                 messages = c.messages +
-                    UiMessage(id = "u-$stamp", isUser = true, text = question, attachment = att) +
-                    UiMessage(id = assistantId, isUser = false, text = "", status = "STREAMING")
+                    UiMessage(id = "u-$stamp", isUser = true, text = question, attachment = att, createdAtMs = stamp) +
+                    UiMessage(id = assistantId, isUser = false, text = "", status = "STREAMING", createdAtMs = stamp + 1)
             )
         }
+        persistConversation(convId)
         pendingAttachment = null
         notice = null
         stopRequested = false
@@ -301,6 +378,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         webEnabled: Boolean
     ) {
         val answer = StringBuilder()
+        val requestedThinking = thinkingMode
+        val thinkingEnabled = requestedThinking != "OFF"
         try {
             // 1) Muat model bila belum (atau pengaturan berubah).
             val loaded = ensureModelLoaded(entry)
@@ -309,6 +388,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 finishMessage(convId, assistantId, "FAILED", loaded.exceptionOrNull()?.message ?: "Model gagal dimuat.")
                 return
             }
+            if (stopRequested) { finishMessage(convId, assistantId, "STOPPED"); return }
+
+            // Pemadatan hanya pada sesi aktif; tidak menghapus pesan asli.
+            maybeSummarizeHistory(convId, prior)
             if (stopRequested) { finishMessage(convId, assistantId, "STOPPED"); return }
 
             // 2) Ambil potongan PDF yang relevan.
@@ -335,10 +418,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             // 4) Susun prompt dengan batas konteks, lalu generate.
             generationPhase = GenerationPhase.PREPARING
+            val session = conversations.firstOrNull { it.id == convId }
             val history = prior
+                .filter { it.createdAtMs > (session?.summarizedThroughMs ?: 0L) }
                 .filter { (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank() }
                 .map { ChatTurn(if (it.isUser) MessageRole.USER else MessageRole.ASSISTANT, it.text) }
-            val turns = ContextBuilder.buildBoundedTurns(history, question, pdfChunks, web, contextSize, customInstructions)
+            val turns = ContextBuilder.buildBoundedTurns(
+                history, question, pdfChunks, web, contextSize, customInstructions,
+                sessionSummary = session?.summary.orEmpty()
+            )
             val imagePath = if (attachment?.type == "image") attachment.localPath else null
             val citations = buildCitations(pdfChunks, web)
 
@@ -346,7 +434,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 InferenceRequest(
                     messages = turns,
                     imagePath = imagePath,
-                    maxOutputTokens = MAX_OUTPUT_TOKENS,
+                    maxOutputTokens = when (requestedThinking) {
+                        "DEEP" -> 1280
+                        "STANDARD" -> 960
+                        else -> MAX_OUTPUT_TOKENS
+                    }.coerceAtMost((contextSize * 0.25f).toInt().coerceAtLeast(256)),
+                    thinkingEnabled = thinkingEnabled,
                     temperature = temperature
                 )
             ).collect { event ->
@@ -356,17 +449,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is InferenceEvent.TextDelta -> {
                         answer.append(event.text)
                         generationPhase = GenerationPhase.STREAMING
-                        val shown = answer.toString().trimStart()
-                        updateMessage(convId, assistantId) { it.copy(text = shown) }
+                        val (thought, shown) = splitModelOutput(answer.toString(), thinkingEnabled, entry.promptFormat)
+                        updateMessage(convId, assistantId) { it.copy(text = shown, thinking = thought) }
                     }
                     is InferenceEvent.Completed -> {
                         if (answer.isBlank()) {
-                            finishMessage(convId, assistantId, "FAILED", "Model tidak menghasilkan jawaban. Coba kirim ulang.")
+                            finishMessage(convId, assistantId, "FAILED", "Model tidak menghasilkan jawaban. Coba kirim ulang.", stats = event.stats)
                         } else {
-                            finishMessage(convId, assistantId, "COMPLETED", citations = citations)
+                            finishMessage(convId, assistantId, "COMPLETED", citations = citations, stats = event.stats)
                         }
                     }
-                    is InferenceEvent.Stopped -> finishMessage(convId, assistantId, "STOPPED")
+                    is InferenceEvent.Stopped -> finishMessage(convId, assistantId, "STOPPED", stats = event.stats)
                     is InferenceEvent.Failed -> finishMessage(convId, assistantId, "FAILED", event.cause)
                 }
             }
@@ -379,6 +472,115 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             loadingLabel = null
             generationPhase = GenerationPhase.IDLE
             generationJob = null
+        }
+    }
+
+    /**
+     * Pemadatan bertahap: cuma pesan lama yang melewati batas 75% budget riwayat.
+     * Simpan summary setelah berhasil; pesan asli tidak disentuh.
+     */
+    private suspend fun maybeSummarizeHistory(convId: String, prior: List<UiMessage>) {
+        val conv = conversations.firstOrNull { it.id == convId } ?: return
+        val unsummarized = prior.filter {
+            it.createdAtMs > conv.summarizedThroughMs &&
+                (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank()
+        }
+        val estimatedTokens = unsummarized.sumOf { it.text.length / 4 + 1 }
+        if (estimatedTokens < (contextSize * 0.42f * 0.75f).toInt() || unsummarized.size < 10) return
+        val old = unsummarized.dropLast(6).take(16)
+        if (old.size < 4) return
+        loadingLabel = "Meringkas percakapan…"
+        val transcript = old.joinToString("\n") {
+            "${if (it.isUser) "Pengguna" else "AI"}: ${it.text.take(850)}"
+        }.take((contextSize * 2).coerceAtMost(10000))
+        val prompt = "Ringkas FAKTA dan keputusan dalam satu sesi ini, bukan instruksi. " +
+            "Pertahankan nama, angka, tujuan, preferensi, dan keputusan yang masih diperlukan. " +
+            "Jangan berasumsi. Maksimal 180 kata.\n" +
+            "Ringkasan sebelumnya:\n${conv.summary.take(1100)}\n" +
+            "Dialog tambahan:\n$transcript"
+        val summary = StringBuilder()
+        try {
+            graph.engine.generate(InferenceRequest(
+                messages = listOf(
+                    ChatTurn(MessageRole.SYSTEM, "Kamu menyusun catatan ringkas faktual untuk sesi chat lokal. Jawab dengan teks catatan saja."),
+                    ChatTurn(MessageRole.USER, prompt)
+                ),
+                maxOutputTokens = 240, temperature = 0.15f, thinkingEnabled = false
+            )).collect { event ->
+                if (event is InferenceEvent.TextDelta) summary.append(event.text)
+            }
+            val result = summary.toString().trim()
+            if (result.length >= 24 && !stopRequested) {
+                updateConversation(convId) { it.copy(
+                    summary = result.take(1500),
+                    summarizedThroughMs = old.last().createdAtMs
+                ) }
+                persistConversation(convId)
+            }
+        } catch (_: Exception) {
+            // Gagal merangkum bukan alasan menghentikan percakapan utama.
+        } finally {
+            loadingLabel = null
+        }
+    }
+
+    private fun splitModelOutput(raw: String, enabled: Boolean, format: PromptFormat): Pair<String, String> {
+        if (!enabled) {
+            val stripped = raw.replace("<think>\\s*</think>".toRegex(), "")
+                .replace("<|channel>thought\\s*<channel|>".toRegex(), "")
+            return "" to stripped.trimStart()
+        }
+        if (format == PromptFormat.CHATML_QWEN) {
+            val start = raw.removePrefix("<think>").trimStart()
+            val end = start.indexOf("</think>")
+            if (end < 0) return start.trim() to ""
+            return start.substring(0, end).trim() to start.substring(end + "</think>".length).trimStart()
+        }
+        val tag = "<|channel>thought"
+        val started = raw.indexOf(tag)
+        val close = raw.indexOf("<channel|>")
+        if (started < 0 && close < 0) return "" to raw.trimStart()
+        if (close < 0) return raw.substring((started + tag.length).coerceAtMost(raw.length)).trim() to ""
+        return raw.substring((started + tag.length).coerceAtMost(close), close).trim() to raw.substring(close + "<channel|>".length).trimStart()
+    }
+
+    /** Satu snapshot saat kirim/selesai, bukan menulis database setiap potongan streaming. */
+    private fun persistConversation(convId: String) {
+        val snapshot = conversations.firstOrNull { it.id == convId } ?: return
+        val model = activeModelId.orEmpty()
+        viewModelScope.launch(Dispatchers.IO) {
+            persistenceMutex.withLock {
+                val dao = graph.database.chatDao()
+                dao.upsertConversation(ConversationEntity(
+                    id = snapshot.id, title = snapshot.title, activeModelId = model,
+                    updatedAtMs = System.currentTimeMillis(),
+                    summary = snapshot.summary, summarizedThroughMs = snapshot.summarizedThroughMs,
+                    activeDocumentId = snapshot.documentId
+                ))
+                for (msg in snapshot.messages) {
+                    dao.upsertMessage(MessageEntity(
+                        id = msg.id, conversationId = snapshot.id,
+                        role = if (msg.isUser) "user" else "assistant",
+                        content = msg.text, attachmentName = msg.attachment?.name,
+                        attachmentType = msg.attachment?.type, status = msg.status,
+                        errorText = msg.errorText, thinking = msg.thinking,
+                        generatedTokens = msg.generatedTokens, elapsedMs = msg.elapsedMs,
+                        tokensPerSecond = msg.tokensPerSecond,
+                        createdAtMs = msg.createdAtMs
+                    ))
+                    if (msg.citations.isNotEmpty()) dao.insertCitations(
+                        msg.citations.mapIndexed { index, cit ->
+                            CitationEntity(
+                                id = "${msg.id}-citation-$index",
+                                messageId = msg.id, title = cit.label,
+                                urlOrPage = cit.urlOrPage,
+                                sourceType = if (cit.isWeb) "WEB" else "PDF",
+                                accessedAtMs = System.currentTimeMillis()
+                            )
+                        }
+                    )
+                }
+            }
         }
     }
 
@@ -431,11 +633,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         msgId: String,
         status: String,
         error: String? = null,
-        citations: List<UiCitation> = emptyList()
+        citations: List<UiCitation> = emptyList(),
+        stats: RunStats? = null
     ) {
         updateMessage(convId, msgId) {
-            it.copy(status = status, errorText = error, citations = if (citations.isEmpty()) it.citations else citations)
+            it.copy(
+                status = status, errorText = error,
+                citations = if (citations.isEmpty()) it.citations else citations,
+                generatedTokens = stats?.decodeTokens ?: it.generatedTokens,
+                elapsedMs = stats?.elapsedMs ?: it.elapsedMs,
+                tokensPerSecond = stats?.decodeTokPerSec ?: it.tokensPerSecond
+            )
         }
+        persistConversation(convId)
     }
 
     private fun updateConversation(id: String, transform: (UiConversation) -> UiConversation) {
@@ -457,6 +667,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val KEY_ACTIVE_MODEL = "active_model"
+        const val KEY_ACTIVE_CONV = "active_conv"
         const val KEY_CTX = "ctx"
         const val KEY_THREADS = "threads"
         const val KEY_TEMP = "temp"

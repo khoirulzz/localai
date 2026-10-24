@@ -1,6 +1,13 @@
 package id.localai.app.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -43,7 +50,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -96,14 +106,21 @@ data class UiMessage(
     val attachment: UiAttachment? = null,
     val citations: List<UiCitation> = emptyList(),
     val status: String = "COMPLETED", // "STREAMING" | "COMPLETED" | "STOPPED" | "FAILED"
-    val errorText: String? = null
+    val errorText: String? = null,
+    val thinking: String = "",
+    val generatedTokens: Int = 0,
+    val elapsedMs: Long = 0L,
+    val tokensPerSecond: Float = 0f,
+    val createdAtMs: Long = System.currentTimeMillis()
 )
 
 data class UiConversation(
     val id: String,
     val title: String,
     val messages: List<UiMessage>,
-    val documentId: String? = null
+    val documentId: String? = null,
+    val summary: String = "",
+    val summarizedThroughMs: Long = 0L
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -121,6 +138,7 @@ fun LocalAiAppRoot() {
     var keyInput by remember { mutableStateOf("") }
     var showModelPicker by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
+    var showThinkingSheet by remember { mutableStateOf(false) }
 
     val vm: ChatViewModel = viewModel()
     val installedModelIds by vm.installedModelIds.collectAsState()
@@ -266,15 +284,9 @@ fun LocalAiAppRoot() {
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(LocalAiDimens.MinTouchTarget)
-                                        .clickable { scope.launch { drawerState.open() } }
-                                        .semantics { contentDescription = "Buka riwayat percakapan" },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text("≡", color = colors.foreground, fontSize = 22.sp)
-                                }
+                                HeaderCircleAction(
+                                    menu = true, colors = colors, description = "Buka riwayat percakapan"
+                                ) { scope.launch { drawerState.open() } }
 
                                 Row(
                                     modifier = Modifier
@@ -299,15 +311,9 @@ fun LocalAiAppRoot() {
                                     Text("▾", color = colors.secondaryText, fontSize = 14.sp)
                                 }
 
-                                Box(
-                                    modifier = Modifier
-                                        .size(LocalAiDimens.MinTouchTarget)
-                                        .clickable { startNewConversation() }
-                                        .semantics { contentDescription = "Percakapan baru" },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text("✎", color = colors.foreground, fontSize = 18.sp)
-                                }
+                                HeaderCircleAction(
+                                    menu = false, colors = colors, description = "Percakapan baru"
+                                ) { startNewConversation() }
                             }
 
                             // 5.2 Conversation content or Empty State
@@ -351,9 +357,20 @@ fun LocalAiAppRoot() {
                                 } else {
                                     val listState = rememberLazyListState()
                                     val lastMsg = currentConv.messages.lastOrNull()
-                                    LaunchedEffect(currentConv.id, currentConv.messages.size, lastMsg?.text?.length) {
-                                        if (currentConv.messages.isNotEmpty()) listState.scrollToItem(currentConv.messages.lastIndex)
+                                    val dragging by listState.interactionSource.collectIsDraggedAsState()
+                                    var followStream by remember(currentConv.id) { mutableStateOf(true) }
+                                    LaunchedEffect(dragging) { if (dragging) followStream = false }
+                                    LaunchedEffect(currentConv.id, currentConv.messages.size) {
+                                        if (followStream && currentConv.messages.isNotEmpty()) {
+                                            listState.scrollToItem(currentConv.messages.lastIndex)
+                                        }
                                     }
+                                    LaunchedEffect(lastMsg?.text?.length, lastMsg?.thinking?.length) {
+                                        if (followStream && currentConv.messages.isNotEmpty()) {
+                                            listState.scrollToItem(currentConv.messages.lastIndex, 100000)
+                                        }
+                                    }
+                                    Box(modifier = Modifier.fillMaxSize()) {
                                     LazyColumn(
                                         state = listState,
                                         modifier = Modifier.fillMaxSize(),
@@ -403,16 +420,33 @@ fun LocalAiAppRoot() {
                                                     modifier = Modifier.fillMaxWidth(),
                                                     horizontalAlignment = Alignment.Start
                                                 ) {
+                                                    if (msg.thinking.isNotBlank()) {
+                                                        ThinkingDisclosure(
+                                                            text = msg.thinking,
+                                                            streaming = msg.status == "STREAMING",
+                                                            colors = colors
+                                                        )
+                                                        Spacer(Modifier.height(8.dp))
+                                                    }
                                                     if (msg.text.isBlank() && msg.status == "STREAMING") {
+                                                        LoadingDots(vm.phaseLabel ?: if (msg.thinking.isNotBlank()) "Menyusun jawaban" else "Menyiapkan", colors)
+                                                    } else if (msg.text.isNotBlank()) {
+                                                        SelectionContainer {
+                                                            if (msg.status == "STREAMING") {
+                                                                Text(msg.text, style = LocalAiTypography.assistantBody, color = colors.foreground)
+                                                            } else {
+                                                                MarkdownText(text = msg.text)
+                                                            }
+                                                        }
+                                                    }
+                                                    if (msg.generatedTokens > 0 && msg.elapsedMs > 0L && msg.status != "STREAMING") {
+                                                        Spacer(Modifier.height(6.dp))
                                                         Text(
-                                                            text = vm.phaseLabel ?: "Menyiapkan…",
+                                                            "${String.format(Locale.US, "%.1f", msg.tokensPerSecond)} tok/dtk  ·  " +
+                                                                "${String.format(Locale.US, "%.1f", msg.elapsedMs / 1000.0)} dtk  ·  ${msg.generatedTokens} token",
                                                             style = LocalAiTypography.metadata,
                                                             color = colors.secondaryText
                                                         )
-                                                    } else if (msg.text.isNotBlank()) {
-                                                        SelectionContainer {
-                                                            MarkdownText(text = msg.text)
-                                                        }
                                                     }
                                                     if (msg.status == "STOPPED") {
                                                         Spacer(Modifier.height(4.dp))
@@ -448,6 +482,19 @@ fun LocalAiAppRoot() {
                                                 }
                                             }
                                         }
+                                    }
+                                    if (!followStream && generationPhase != GenerationPhase.IDLE) {
+                                        Box(modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp)) {
+                                            OutlinedButton(onClick = {
+                                                followStream = true
+                                                scope.launch {
+                                                    listState.scrollToItem(currentConv.messages.lastIndex, 100000)
+                                                }
+                                            }) {
+                                                Text("↓  Jawaban terbaru")
+                                            }
+                                        }
+                                    }
                                     }
                                 }
                             }
@@ -543,6 +590,7 @@ fun LocalAiAppRoot() {
                                             Text("＋", color = colors.foreground, fontSize = 20.sp)
                                         }
 
+                                        // Tombol pencarian tetap terpisah dari reasoning lokal.
                                         // Functional Search toggle (monochrome selected state)
                                         Box(
                                             modifier = Modifier
@@ -569,6 +617,24 @@ fun LocalAiAppRoot() {
                                                 text = "◉ Search",
                                                 fontSize = 13.sp,
                                                 color = if (searchEnabled) colors.searchActiveText else colors.secondaryText
+                                            )
+                                        }
+                                        Spacer(Modifier.width(2.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(18.dp))
+                                                .border(1.dp, colors.hairline, RoundedCornerShape(18.dp))
+                                                .clickable(enabled = activeModel != null) { showThinkingSheet = true }
+                                                .padding(horizontal = 11.dp, vertical = 6.dp)
+                                                .semantics { contentDescription = "Mode berpikir" }
+                                        ) {
+                                            Text(
+                                                when (vm.thinkingMode) {
+                                                    "STANDARD" -> "Pikir"
+                                                    "DEEP" -> "Pikir lebih"
+                                                    else -> "Cepat"
+                                                },
+                                                fontSize = 13.sp, color = colors.secondaryText
                                             )
                                         }
                                     }
@@ -953,6 +1019,38 @@ fun LocalAiAppRoot() {
                 }
             }
 
+            if (showThinkingSheet) {
+                ModalBottomSheet(
+                    onDismissRequest = { showThinkingSheet = false },
+                    containerColor = colors.inputSurface,
+                    contentColor = colors.foreground
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
+                        Text("Mode berpikir", style = LocalAiTypography.headerModel, color = colors.foreground)
+                        Spacer(Modifier.height(12.dp))
+                        listOf(
+                            "OFF" to "Cepat",
+                            "STANDARD" to "Pikir",
+                            "DEEP" to "Pikir lebih"
+                        ).forEach { (mode, label) ->
+                            Text(
+                                "${if (vm.thinkingMode == mode) "✓  " else "     "}$label",
+                                color = colors.foreground,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { vm.updateThinkingMode(mode); showThinkingSheet = false }
+                                    .padding(vertical = 14.dp)
+                            )
+                        }
+                        Text(
+                            "Mode Pikir lebih memberi anggaran token lebih besar, bukan level bawaan model. " +
+                                "Kecepatan tergantung model dan panjang konteks.",
+                            style = LocalAiTypography.metadata, color = colors.secondaryText
+                        )
+                    }
+                }
+            }
+
             // Sheet lampiran
             if (showAttachmentSheet) {
                 ModalBottomSheet(
@@ -979,6 +1077,113 @@ fun LocalAiAppRoot() {
                                 .clickable { showAttachmentSheet = false; pickPdf.launch("application/pdf") }
                                 .padding(vertical = 14.dp)
                         )
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun HeaderCircleAction(
+    menu: Boolean,
+    colors: LocalAiColors,
+    description: String,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .background(colors.inputSurface)
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = description },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.size(25.dp)) {
+            val w = size.width
+            val h = size.height
+            val sw = 2.3.dp.toPx()
+            if (menu) {
+                drawLine(colors.foreground, Offset(w * 0.16f, h * 0.35f), Offset(w * 0.84f, h * 0.35f), sw, cap = StrokeCap.Round)
+                drawLine(colors.foreground, Offset(w * 0.16f, h * 0.65f), Offset(w * 0.65f, h * 0.65f), sw, cap = StrokeCap.Round)
+            } else {
+                drawLine(colors.foreground, Offset(w * 0.24f, h * 0.77f), Offset(w * 0.76f, h * 0.23f), sw, cap = StrokeCap.Round)
+                drawLine(colors.foreground, Offset(w * 0.18f, h * 0.83f), Offset(w * 0.34f, h * 0.78f), sw, cap = StrokeCap.Round)
+                drawLine(colors.foreground, Offset(w * 0.64f, h * 0.21f), Offset(w * 0.79f, h * 0.36f), sw, cap = StrokeCap.Round)
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoadingDots(label: String, colors: LocalAiColors) {
+    val transition = rememberInfiniteTransition(label = "thinking-dots")
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        repeat(3) { index ->
+            val opacity by transition.animateFloat(
+                initialValue = 0.25f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 650, delayMillis = index * 140),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "dot-$index"
+            )
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .alpha(opacity)
+                    .clip(CircleShape)
+                    .background(colors.foreground)
+            )
+        }
+        Spacer(Modifier.width(4.dp))
+        Text(label, color = colors.secondaryText, style = LocalAiTypography.metadata)
+    }
+}
+
+@Composable
+private fun ThinkingDisclosure(text: String, streaming: Boolean, colors: LocalAiColors) {
+    var expanded by remember { mutableStateOf(false) }
+    Column {
+        Row(
+            modifier = Modifier.clickable { expanded = !expanded }.padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                if (streaming) "Sedang berpikir" else "Proses berpikir",
+                style = LocalAiTypography.metadata,
+                color = colors.secondaryText
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(if (expanded) "⌃" else "⌄", color = colors.secondaryText)
+        }
+        AnimatedVisibility(visible = expanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, colors.hairline, RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val parts = text.split(Regex("\\n\\s*\\n")).filter { it.isNotBlank() }
+                parts.forEachIndexed { i, part ->
+                    var open by remember(i) { mutableStateOf(true) }
+                    if (parts.size > 1) {
+                        Text(
+                            "Bagian ${i + 1}  ${if (open) "⌃" else "⌄"}",
+                            style = LocalAiTypography.metadata,
+                            color = colors.secondaryText,
+                            modifier = Modifier.clickable { open = !open }
+                        )
+                    }
+                    if (open) {
+                        Text(part, style = LocalAiTypography.metadata, color = colors.secondaryText)
                     }
                 }
             }

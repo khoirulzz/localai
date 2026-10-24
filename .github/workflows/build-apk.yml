@@ -3,6 +3,8 @@ name: Build APK
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -60,11 +62,17 @@ jobs:
         run: |
           echo "::notice title=APK::$(find app/build -name '*.apk' 2>/dev/null | tr '\n' ' ') | $(ls app/build/outputs 2>&1 | tr '\n' ' ')"
 
+      - name: Package update ZIP
+        run: |
+          zip -j Nalaro-AI-v0.4.1-APK.zip app/build/outputs/apk/debug/app-debug.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: local-ai-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            Nalaro-AI-v0.4.1-APK.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -73,10 +81,11 @@ jobs:
           find app/build/outputs -name "*.apk" -exec ls -lh {} \;
 
       - name: Publish GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk local-ai-debug.apk
-          gh release create "build-${{ github.run_number }}" local-ai-debug.apk \
+          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.1-APK.zip \
             --title "Debug build #${{ github.run_number }}" \
             --notes "Debug APK (arm64-v8a), commit ${{ github.sha }}" --prerelease

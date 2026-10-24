@@ -92,7 +92,7 @@ class LlamaCppEngine(
             send(InferenceEvent.VisionEncoding)
         }
 
-        val formattedPrompt = formatPrompt(config.promptFormat, request.messages, withImage = request.imagePath != null)
+        val formattedPrompt = formatPrompt(config.promptFormat, request.messages, withImage = request.imagePath != null, thinkingEnabled = request.thinkingEnabled)
         val prefillTokenEstimate = (formattedPrompt.length / 4).coerceAtLeast(1)
         val startMs = SystemClock.elapsedRealtime()
         var firstTokenMs = 0L
@@ -100,7 +100,7 @@ class LlamaCppEngine(
         val fullBuilder = StringBuilder()
         val outer: ProducerScope<InferenceEvent> = this
 
-        // Coalescing 40 ms (DESIGN.md 5.4): satu event per jendela, bukan per token.
+        // Batasi recomposition Markdown selama streaming agar scrolling tetap responsif.
         val pendingChunk = StringBuilder()
         var lastFlushMs = SystemClock.elapsedRealtime()
 
@@ -119,7 +119,7 @@ class LlamaCppEngine(
                         emittedPieces++
                         fullBuilder.append(piece)
                         pendingChunk.append(piece)
-                        if (now - lastFlushMs >= 40L) {
+                        if (now - lastFlushMs >= 90L) {
                             outer.trySend(InferenceEvent.TextDelta(pendingChunk.toString()))
                             pendingChunk.clear()
                             lastFlushMs = now
@@ -147,6 +147,7 @@ class LlamaCppEngine(
             decodeTokens = decodeTokens,
             prefillTokPerSec = prefillTokenEstimate / (ttft / 1000f),
             decodeTokPerSec = decodeTokens / decodeDurationSec,
+            elapsedMs = totalMs,
             peakPssMb = (Debug.getPss() / 1024).toInt(),
             cpuThreads = config.cpuThreads,
             contextTokens = config.contextTokens
@@ -194,7 +195,7 @@ class LlamaCppEngine(
          * supaya model kecil tidak masuk loop berpikir. Gambar (jika ada) menempel pada
          * giliran pengguna terakhir.
          */
-        internal fun formatPrompt(format: PromptFormat, messages: List<ChatTurn>, withImage: Boolean): String {
+        internal fun formatPrompt(format: PromptFormat, messages: List<ChatTurn>, withImage: Boolean, thinkingEnabled: Boolean = false): String {
             val lastUserIndex = messages.indexOfLast { it.role == MessageRole.USER }
             fun contentOf(index: Int, turn: ChatTurn): String {
                 val text = turn.content.trim()
@@ -213,7 +214,11 @@ class LlamaCppEngine(
                         sb.append("<|im_start|>").append(tag).append('\n')
                         sb.append(contentOf(i, turn)).append("<|im_end|>\n")
                     }
-                    sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                    if (thinkingEnabled) {
+                        sb.append("<|im_start|>assistant\n<think>\n")
+                    } else {
+                        sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                    }
                 }
                 PromptFormat.GEMMA4 -> {
                     sb.append("<bos>")
@@ -224,9 +229,12 @@ class LlamaCppEngine(
                             MessageRole.ASSISTANT -> "model"
                         }
                         sb.append("<|turn>").append(tag).append('\n')
-                        sb.append(contentOf(i, turn)).append("<turn|>\n")
+                        val text = if (turn.role == MessageRole.SYSTEM && thinkingEnabled) {
+                            "<|think|>\n" + contentOf(i, turn)
+                        } else contentOf(i, turn)
+                        sb.append(text).append("<turn|>\n")
                     }
-                    sb.append("<|turn>model\n<|channel>thought\n<channel|>")
+                    sb.append("<|turn>model\n")
                 }
             }
             return sb.toString()

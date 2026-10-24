@@ -45,6 +45,7 @@ data class InferenceRequest(
     val messages: List<ChatTurn>,
     val imagePath: String? = null,
     val maxOutputTokens: Int = 512,
+    val thinkingEnabled: Boolean = false,
     val temperature: Float = 0.6f
 )
 
@@ -56,6 +57,7 @@ data class RunStats(
     val decodeTokens: Int,
     val prefillTokPerSec: Float,
     val decodeTokPerSec: Float,
+    val elapsedMs: Long,
     val peakPssMb: Int,
     val cpuThreads: Int,
     val contextTokens: Int
