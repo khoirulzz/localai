@@ -21,3 +21,6 @@ local.properties
 *.keystore
 *.jks
 inference/llamacpp/src/main/cpp/llama.cpp/
+
+# keystore debug harus ikut repo agar tanda tangan APK konsisten antar-build
+!app/debug.keystore
