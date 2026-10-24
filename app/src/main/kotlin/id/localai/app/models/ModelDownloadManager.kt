@@ -47,23 +47,25 @@ object ModelCatalog {
             licenseName = "Apache-2.0",
             quantization = "GGUF Q4_K_M",
             ggufUrl = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
-            ggufSizeBytes = 1_280_000_000L,
+            ggufSizeBytes = 1_280_835_840L,
             supportsVision = true,
             promptFormat = PromptFormat.CHATML_QWEN,
             projectorUrl = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-F16.gguf",
-            projectorSizeBytes = 668_000_000L,
+            projectorSizeBytes = 668_227_264L,
             minFreeRamMb = 2800
         ),
         ModelManifestEntry(
             id = "qwen3.5-0.8b-q4_k_m",
             displayName = "Qwen3.5 0.8B",
-            roleSummary = "Ringan & cepat · Hemat memori untuk obrolan teks harian",
+            roleSummary = "Ringan & cepat · Visi opsional dengan mmproj",
             licenseName = "Apache-2.0",
             quantization = "GGUF Q4_K_M",
             ggufUrl = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
-            ggufSizeBytes = 533_000_000L,
-            supportsVision = false,
+            ggufSizeBytes = 532_517_120L,
+            supportsVision = true,
             promptFormat = PromptFormat.CHATML_QWEN,
+            projectorUrl = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf",
+            projectorSizeBytes = 204_987_232L,
             minFreeRamMb = 1600
         ),
         ModelManifestEntry(
@@ -108,15 +110,31 @@ class ModelDownloadManager(private val context: Context) {
     fun getInstalledProjectorFile(modelId: String): File =
         File(File(context.filesDir, "models/$modelId"), "mmproj.gguf")
 
-    /** Model dianggap terpasang bila berkas utama (dan proyektor, untuk model visi) sudah utuh. */
+    /**
+     * GGUF utama saja sudah cukup untuk chat teks. Proyektor visi adalah unduhan opsional.
+     * File parsial (.part) tidak boleh ditandai sebagai terpasang.
+     */
     fun isInstalled(entry: ModelManifestEntry): Boolean {
         val gguf = getInstalledGgufFile(entry.id)
-        if (!gguf.exists() || gguf.length() == 0L) return false
-        if (entry.supportsVision && entry.projectorUrl != null) {
-            val proj = getInstalledProjectorFile(entry.id)
-            if (!proj.exists() || proj.length() == 0L) return false
-        }
-        return true
+        return gguf.isFile && gguf.length() >= 4L
+    }
+
+    fun hasVisionProjector(entry: ModelManifestEntry): Boolean {
+        if (!entry.supportsVision) return false
+        val proj = getInstalledProjectorFile(entry.id)
+        return proj.isFile && proj.length() >= 4L
+    }
+
+    fun bytesOnDiskMain(entry: ModelManifestEntry): Long {
+        val gguf = getInstalledGgufFile(entry.id)
+        return (if (gguf.exists()) gguf.length() else 0L) +
+            (if (partOf(gguf).exists()) partOf(gguf).length() else 0L)
+    }
+
+    fun bytesOnDiskProjector(entry: ModelManifestEntry): Long {
+        val proj = getInstalledProjectorFile(entry.id)
+        return (if (proj.exists()) proj.length() else 0L) +
+            (if (partOf(proj).exists()) partOf(proj).length() else 0L)
     }
 
     /** Byte yang sudah ada di disk (berkas final + sisa unduhan .part). */

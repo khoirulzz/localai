@@ -143,6 +143,8 @@ fun LocalAiAppRoot() {
     val vm: ChatViewModel = viewModel()
     val installedModelIds by vm.installedModelIds.collectAsState()
     val downloads by vm.downloads.collectAsState()
+    val visionInstalled by vm.visionInstalled.collectAsState()
+    val visionDownloads by vm.visionDownloads.collectAsState()
     val activeModelId = vm.activeModelId
     val activeModel: ModelManifestEntry? = if (installedModelIds.isNotEmpty()) vm.activeEntry else null
 
@@ -688,7 +690,7 @@ fun LocalAiAppRoot() {
                             }
                             Spacer(Modifier.height(8.dp))
                             Text(
-                                "Sudah punya berkas model (.gguf)? Tekan Impor lalu pilih berkasnya, tanpa unduh ulang. Untuk model yang bisa membaca gambar, pilih juga berkas mmproj.",
+                                "Model GGUF utama cukup untuk chat teks. Proyektor mmproj adalah tambahan opsional untuk membaca gambar.",
                                 style = LocalAiTypography.metadata,
                                 color = colors.secondaryText
                             )
@@ -699,6 +701,10 @@ fun LocalAiAppRoot() {
                                     val ui = downloads[entry.id]
                                     val status = ui?.status ?: DownloadStatus.IDLE
                                     val busy = status == DownloadStatus.DOWNLOADING || status == DownloadStatus.VERIFYING
+                                    val visionReady = visionInstalled.contains(entry.id)
+                                    val visionUi = visionDownloads[entry.id]
+                                    val visionStatus = visionUi?.status ?: DownloadStatus.IDLE
+                                    val visionBusy = visionStatus == DownloadStatus.DOWNLOADING || visionStatus == DownloadStatus.VERIFYING
                                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
@@ -708,7 +714,7 @@ fun LocalAiAppRoot() {
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Text(entry.displayName, style = LocalAiTypography.headerModel, color = colors.foreground)
                                                 Text(
-                                                    "${entry.quantization} · ${formatBytes(entry.totalSizeBytes)}",
+                                                    "${entry.quantization} · ${formatBytes(entry.ggufSizeBytes)}",
                                                     style = LocalAiTypography.metadata,
                                                     color = colors.secondaryText
                                                 )
@@ -719,6 +725,14 @@ fun LocalAiAppRoot() {
                                                         if (entry.id != activeModelId) {
                                                             Text("Pakai", color = colors.foreground, modifier = Modifier.clickable { vm.selectModel(entry.id) })
                                                         }
+                                                        Text(
+                                                            "Impor",
+                                                            color = colors.secondaryText,
+                                                            modifier = Modifier.clickable {
+                                                                importTarget = entry
+                                                                importPicker.launch(arrayOf("*/*"))
+                                                            }
+                                                        )
                                                         Text("Hapus", color = colors.foreground, modifier = Modifier.clickable { vm.deleteModel(entry) })
                                                     }
                                                     busy -> Text("Jeda", color = colors.foreground, modifier = Modifier.clickable { vm.pauseDownload(entry) })
@@ -745,6 +759,52 @@ fun LocalAiAppRoot() {
                                             }
                                         }
                                         Text(entry.roleSummary, style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                        if (entry.supportsVision && entry.projectorUrl != null) {
+                                            Spacer(Modifier.height(8.dp))
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    if (visionReady) "Visi siap · mmproj"
+                                                    else "Visi opsional · ${formatBytes(entry.projectorSizeBytes)}",
+                                                    style = LocalAiTypography.metadata,
+                                                    color = colors.secondaryText,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                if (isInstalled && !visionReady) {
+                                                    Text(
+                                                        if (visionBusy) "Jeda"
+                                                        else if (visionStatus == DownloadStatus.PAUSED) "Lanjutkan visi"
+                                                        else "Unduh visi",
+                                                        style = LocalAiTypography.metadata,
+                                                        color = colors.foreground,
+                                                        modifier = Modifier.clickable {
+                                                            if (visionBusy) vm.pauseDownload(entry) else vm.downloadProjector(entry)
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                            if (visionUi != null && visionStatus != DownloadStatus.IDLE &&
+                                                visionStatus != DownloadStatus.DOWNLOADING && visionStatus != DownloadStatus.VERIFYING &&
+                                                !visionReady && visionUi.message != null
+                                            ) {
+                                                Text(visionUi.message, style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                            }
+                                            if (visionBusy) {
+                                                LinearProgressIndicator(
+                                                    progress = { visionUi?.fraction ?: 0f },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    color = colors.interactive,
+                                                    trackColor = colors.hairline
+                                                )
+                                                Text(
+                                                    "Proyektor · ${formatBytes(visionUi?.downloadedBytes ?: 0)}",
+                                                    style = LocalAiTypography.metadata, color = colors.secondaryText
+                                                )
+                                            }
+                                        }
                                         if (!isInstalled && ui != null && status != DownloadStatus.IDLE) {
                                             Spacer(Modifier.height(6.dp))
                                             if (status == DownloadStatus.VERIFYING) {

@@ -56,15 +56,25 @@ class ModelRepository(
     private val _downloads = MutableStateFlow(computeInitialDownloads())
     val downloads: StateFlow<Map<String, DownloadUi>> = _downloads.asStateFlow()
 
+    // Status proyektor terpisah agar model chat tidak ikut dianggap belum terpasang.
+    private val _visionInstalled = MutableStateFlow(computeVisionInstalled())
+    val visionInstalled: StateFlow<Set<String>> = _visionInstalled.asStateFlow()
+
+    private val _visionDownloads = MutableStateFlow<Map<String, DownloadUi>>(emptyMap())
+    val visionDownloads: StateFlow<Map<String, DownloadUi>> = _visionDownloads.asStateFlow()
+
+    private fun computeVisionInstalled(): Set<String> =
+        ModelCatalog.entries.filter { downloader.hasVisionProjector(it) }.map { it.id }.toSet()
+
     private fun computeInstalled(): Set<String> =
         ModelCatalog.entries.filter { downloader.isInstalled(it) }.map { it.id }.toSet()
 
     /** Unduhan yang terhenti saat aplikasi dimatikan tampil sebagai "Dijeda" dengan progres terakhir. */
     private fun computeInitialDownloads(): Map<String, DownloadUi> =
         ModelCatalog.entries.associate { e ->
-            val onDisk = downloader.bytesOnDisk(e)
+            val onDisk = downloader.bytesOnDiskMain(e)
             e.id to if (!downloader.isInstalled(e) && onDisk > 0L) {
-                DownloadUi(DownloadStatus.PAUSED, onDisk, e.totalSizeBytes)
+                DownloadUi(DownloadStatus.PAUSED, onDisk, e.ggufSizeBytes)
             } else DownloadUi()
         }
 
@@ -73,13 +83,13 @@ class ModelRepository(
     fun start(entry: ModelManifestEntry) {
         if (isDownloading(entry.id) || downloader.isInstalled(entry)) return
 
-        val needed = (entry.totalSizeBytes - downloader.bytesOnDisk(entry)).coerceAtLeast(0L)
+        val needed = (entry.ggufSizeBytes - downloader.bytesOnDiskMain(entry)).coerceAtLeast(0L)
         if (!downloader.hasEnoughSpaceFor(needed)) {
             setState(entry.id, DownloadUi(DownloadStatus.FAILED, message = "Ruang penyimpanan tidak cukup (butuh sekitar ${formatBytes(needed)} lagi)."))
             return
         }
 
-        setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, downloader.bytesOnDisk(entry), entry.totalSizeBytes))
+        setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, downloader.bytesOnDiskMain(entry), entry.ggufSizeBytes))
         DownloadService.start(context)
 
         jobs[entry.id] = scope.launch {
@@ -94,11 +104,58 @@ class ModelRepository(
                     entry.id,
                     DownloadUi(
                         status = if (paused) DownloadStatus.PAUSED else DownloadStatus.FAILED,
-                        downloadedBytes = downloader.bytesOnDisk(entry),
-                        totalBytes = entry.totalSizeBytes,
+                        downloadedBytes = downloader.bytesOnDiskMain(entry),
+                        totalBytes = entry.ggufSizeBytes,
                         message = if (paused) null else (e?.message ?: "Unduhan gagal.")
                     )
                 )
+            }
+            jobs.remove(entry.id)
+            if (jobs.isEmpty()) DownloadService.stop(context)
+        }
+    }
+
+    /** Proyektor diunduh sesudah GGUF utama; tidak diperlukan agar model bisa dipakai. */
+    fun startProjector(entry: ModelManifestEntry) {
+        if (!entry.supportsVision || entry.projectorUrl == null ||
+            !downloader.isInstalled(entry) || downloader.hasVisionProjector(entry) ||
+            isDownloading(entry.id)) return
+        val needed = (entry.projectorSizeBytes - downloader.bytesOnDiskProjector(entry)).coerceAtLeast(0L)
+        if (!downloader.hasEnoughSpaceFor(needed)) {
+            _visionDownloads.update { it + (entry.id to DownloadUi(
+                DownloadStatus.FAILED, message = "Penyimpanan tidak cukup untuk proyektor gambar."
+            )) }
+            return
+        }
+        _visionDownloads.update { it + (entry.id to DownloadUi(
+            DownloadStatus.DOWNLOADING,
+            downloader.bytesOnDiskProjector(entry), entry.projectorSizeBytes
+        )) }
+        DownloadService.start(context)
+        jobs[entry.id] = scope.launch {
+            val result = downloader.downloadFileWithResume(
+                entry.id, entry.projectorUrl, entry.projectorSha256,
+                downloader.getInstalledProjectorFile(entry.id),
+                onProgress = { done, total ->
+                    _visionDownloads.update { it + (entry.id to DownloadUi(
+                        DownloadStatus.DOWNLOADING, done,
+                        if (total > 0L) total else entry.projectorSizeBytes
+                    )) }
+                },
+                onVerifying = {
+                    _visionDownloads.update { it + (entry.id to DownloadUi(DownloadStatus.VERIFYING)) }
+                }
+            )
+            if (result.isSuccess) {
+                _visionInstalled.update { it + entry.id }
+                _visionDownloads.update { it - entry.id }
+            } else {
+                val ex = result.exceptionOrNull()
+                _visionDownloads.update { it + (entry.id to DownloadUi(
+                    if (ex is InterruptedException) DownloadStatus.PAUSED else DownloadStatus.FAILED,
+                    downloader.bytesOnDiskProjector(entry), entry.projectorSizeBytes,
+                    ex?.message
+                )) }
             }
             jobs.remove(entry.id)
             if (jobs.isEmpty()) DownloadService.stop(context)
@@ -118,6 +175,8 @@ class ModelRepository(
             running?.join()
             downloader.deleteModelFiles(entry.id)
             _installed.update { it - entry.id }
+            _visionInstalled.update { it - entry.id }
+            _visionDownloads.update { it - entry.id }
             setState(entry.id, DownloadUi())
         }
     }
@@ -131,7 +190,7 @@ class ModelRepository(
         if (uris.isEmpty() || isDownloading(entry.id)) return
         val cancel = AtomicBoolean(false)
         importCancel[entry.id] = cancel
-        setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, 0L, entry.totalSizeBytes, null))
+        setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, 0L, entry.ggufSizeBytes, null))
 
         jobs[entry.id] = scope.launch {
             var error: String? = null
@@ -148,31 +207,26 @@ class ModelRepository(
                     break
                 }
                 val err = copyGguf(uri, target, cancel) { copied ->
-                    setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, doneBefore + copied, entry.totalSizeBytes))
+                    setState(entry.id, DownloadUi(DownloadStatus.DOWNLOADING, doneBefore + copied, entry.ggufSizeBytes))
                 }
                 if (err != null) { error = err; break }
                 doneBefore += target.length()
             }
 
+            if (downloader.isInstalled(entry)) _installed.update { it + entry.id }
+            if (downloader.hasVisionProjector(entry)) _visionInstalled.update { it + entry.id }
             when {
-                downloader.isInstalled(entry) -> {
-                    _installed.update { it + entry.id }
+                error != null -> setState(entry.id, DownloadUi(
+                    DownloadStatus.FAILED, message = error
+                ))
+                cancel.get() -> setState(entry.id, DownloadUi(
+                    DownloadStatus.PAUSED, downloader.bytesOnDiskMain(entry), entry.ggufSizeBytes
+                ))
+                downloader.isInstalled(entry) || downloader.hasVisionProjector(entry) ->
                     setState(entry.id, DownloadUi())
-                }
-                cancel.get() -> setState(
-                    entry.id,
-                    DownloadUi(DownloadStatus.PAUSED, downloader.bytesOnDisk(entry), entry.totalSizeBytes)
-                )
-                else -> setState(
-                    entry.id,
-                    DownloadUi(
-                        DownloadStatus.FAILED,
-                        downloader.bytesOnDisk(entry),
-                        entry.totalSizeBytes,
-                        error ?: if (entry.supportsVision) "Model teks sudah masuk. Pilih juga berkas mmproj, atau tekan Coba lagi untuk mengunduh bagian yang kurang."
-                        else "Berkas tidak dikenali."
-                    )
-                )
+                else -> setState(entry.id, DownloadUi(
+                    DownloadStatus.FAILED, message = "Berkas GGUF belum dipilih."
+                ))
             }
             importCancel.remove(entry.id)
             jobs.remove(entry.id)
@@ -233,7 +287,7 @@ class ModelRepository(
     }
 
     private suspend fun runDownload(entry: ModelManifestEntry): Result<Unit> {
-        val total = entry.totalSizeBytes
+        val total = entry.ggufSizeBytes
         var lastNotify = 0L
 
         suspend fun fetch(url: String, sha: String, target: java.io.File, doneBefore: Long): Result<Unit> {
@@ -267,11 +321,7 @@ class ModelRepository(
         val main = fetch(entry.ggufUrl, entry.ggufSha256, downloader.getInstalledGgufFile(entry.id), 0L)
         if (main.isFailure) return main
 
-        val projUrl = entry.projectorUrl
-        if (entry.supportsVision && projUrl != null) {
-            val proj = fetch(projUrl, entry.projectorSha256, downloader.getInstalledProjectorFile(entry.id), entry.ggufSizeBytes)
-            if (proj.isFailure) return proj
-        }
+        // Vision adalah komponen tambahan yang boleh diunduh/impor kapan saja.
         return Result.success(Unit)
     }
 
