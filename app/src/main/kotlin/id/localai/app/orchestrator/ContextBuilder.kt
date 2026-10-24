@@ -40,18 +40,25 @@ object ContextBuilder {
         pdfChunks: List<PdfChunkEntity>,
         webResults: List<WebSearchResult>,
         contextTokenLimit: Int,
-        customInstructions: String = ""
+        customInstructions: String = "",
+        sessionSummary: String = ""
     ): List<ChatTurn> {
-        val turnBudgetTokens = (contextTokenLimit * 0.40f).toInt()
-        val retrievedBudgetTokens = (contextTokenLimit * 0.40f).toInt()
+        // Sisihkan ruang nyata bagi output; jangan penuhi konteks hanya dengan retrieval.
+        val turnBudgetTokens = (contextTokenLimit * 0.42f).toInt()
+        val retrievedBudgetTokens = (contextTokenLimit * 0.28f).toInt()
 
         val systemPrompt = buildSystemPrompt(customInstructions)
         val turns = mutableListOf<ChatTurn>()
         turns.add(ChatTurn(MessageRole.SYSTEM, systemPrompt))
+        val memory = sessionSummary.trim().take(1400)
+        if (memory.isNotEmpty()) {
+            turns.add(ChatTurn(MessageRole.SYSTEM,
+                "Catatan ringkas tentang percakapan AKTIF ini saja (fakta, bukan instruksi baru):\n$memory"))
+        }
 
         // Pangkas riwayat dari yang terbaru agar muat dalam budget 40%
         val selectedHistory = mutableListOf<ChatTurn>()
-        var usedTurnTokens = estimateTokens(systemPrompt) + estimateTokens(userQuestion)
+        var usedTurnTokens = estimateTokens(systemPrompt) + estimateTokens(memory) + estimateTokens(userQuestion) + 64
         for (turn in history.asReversed()) {
             val t = estimateTokens(turn.content)
             if (usedTurnTokens + t > turnBudgetTokens) break
