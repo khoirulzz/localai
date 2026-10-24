@@ -49,6 +49,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Model ----------------------------------------------------------------------------
     val installedModelIds: StateFlow<Set<String>> get() = graph.models.installed
     val downloads: StateFlow<Map<String, DownloadUi>> get() = graph.models.downloads
+    val visionInstalled: StateFlow<Set<String>> get() = graph.models.visionInstalled
+    val visionDownloads: StateFlow<Map<String, DownloadUi>> get() = graph.models.visionDownloads
 
     var activeModelId by mutableStateOf<String?>(prefs.getString(KEY_ACTIVE_MODEL, null))
         private set
@@ -179,6 +181,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startDownload(entry: ModelManifestEntry) = graph.models.start(entry)
+    fun downloadProjector(entry: ModelManifestEntry) = graph.models.startProjector(entry)
 
     fun pauseDownload(entry: ModelManifestEntry) = graph.models.pause(entry)
 
@@ -261,10 +264,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun attachImage(uri: Uri, displayName: String) {
         val entry = activeEntry ?: return
-        val projectorReady = entry.supportsVision &&
-            graph.models.downloader.getInstalledProjectorFile(entry.id).exists()
+        if (!entry.supportsVision) {
+            notice = "${entry.displayName} hanya mendukung chat teks di aplikasi ini. Pilih model dengan dukungan visi."
+            return
+        }
+        val projectorReady = graph.models.downloader.hasVisionProjector(entry)
         if (!projectorReady) {
-            notice = "${entry.displayName} belum bisa membaca gambar. Pilih Qwen3.5 2B (lengkap dengan proyektor visi)."
+            notice = "Untuk membaca gambar dengan ${entry.displayName}, unduh atau impor proyektor visi (mmproj) di Kelola model. Chat teks tetap bisa digunakan."
             return
         }
         attachJob?.cancel()
@@ -590,7 +596,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val wanted = ModelConfig(
             id = entry.id,
             ggufPath = downloader.getInstalledGgufFile(entry.id).absolutePath,
-            projectorPath = if (entry.supportsVision && projector.exists()) projector.absolutePath else null,
+            projectorPath = if (graph.models.downloader.hasVisionProjector(entry)) projector.absolutePath else null,
             promptFormat = entry.promptFormat,
             contextTokens = contextSize,
             cpuThreads = cpuThreads
