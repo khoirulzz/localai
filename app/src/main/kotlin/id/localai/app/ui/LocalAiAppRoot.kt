@@ -13,6 +13,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.compose.ui.platform.LocalContext
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import id.localai.app.LocalAiApp
+import id.localai.app.models.DownloadStatus
+import id.localai.app.models.formatBytes
 import id.localai.app.search.TavilyKeyStore
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -66,7 +74,10 @@ data class UiAttachment(
     val name: String,
     val type: String, // "image" | "pdf"
     val meta: String,
-    val hasTextLayer: Boolean = true
+    val hasTextLayer: Boolean = true,
+    val localPath: String? = null,
+    val documentId: String? = null,
+    val isProcessing: Boolean = false
 )
 
 data class UiMessage(
@@ -82,7 +93,8 @@ data class UiMessage(
 data class UiConversation(
     val id: String,
     val title: String,
-    val messages: List<UiMessage>
+    val messages: List<UiMessage>,
+    val documentId: String? = null
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -95,56 +107,47 @@ fun LocalAiAppRoot() {
     var currentScreen by remember { mutableStateOf(ActiveScreen.CHAT) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val context = LocalContext.current
-    val keyStore = remember { TavilyKeyStore(context) }
+    val keyStore = remember { (context.applicationContext as LocalAiApp).graph.keyStore }
     var keyInput by remember { mutableStateOf("") }
     var showModelPicker by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
 
-    // Installed model state (Qwen3.5 2B & 0.8B installed by default after setup)
-    var installedModelIds by remember {
-        mutableStateOf(setOf("qwen3.5-2b-q4_k_m", "qwen3.5-0.8b-q4_k_m"))
-    }
-    var activeModelId by remember { mutableStateOf<String?>("qwen3.5-2b-q4_k_m") }
-    val activeModel: ModelManifestEntry? = remember(activeModelId, installedModelIds) {
-        ModelCatalog.entries.find { it.id == activeModelId && installedModelIds.contains(it.id) }
-    }
+    val vm: ChatViewModel = viewModel()
+    val installedModelIds by vm.installedModelIds.collectAsState()
+    val downloads by vm.downloads.collectAsState()
+    val activeModelId = vm.activeModelId
+    val activeModel: ModelManifestEntry? = if (installedModelIds.isNotEmpty()) vm.activeEntry else null
 
     // Tavily BYOK Settings state
     var savedTavilyKey by remember { mutableStateOf(if (runCatching { keyStore.hasSavedKey() }.getOrDefault(false)) "saved" else "") }
     var tavilyStatus by remember { mutableStateOf(if (savedTavilyKey.isNotBlank()) "API key tersimpan (terenkripsi)" else "API key belum disimpan") }
-    var searchEnabled by remember { mutableStateOf(false) }
+    val searchEnabled = vm.searchEnabled
 
-    // Advanced Settings state
-    var contextSize by remember { mutableStateOf(2048) }
-    var cpuThreads by remember { mutableStateOf(4) }
-    var temperature by remember { mutableStateOf(0.6f) }
-
-    // Conversations state
-    var conversations by remember {
-        mutableStateOf(
-            listOf(
-                UiConversation(
-                    id = "conv-1",
-                    title = "Percakapan baru",
-                    messages = emptyList()
-                )
-            )
-        )
-    }
-    var activeConvId by remember { mutableStateOf("conv-1") }
-    val currentConv = conversations.find { it.id == activeConvId } ?: conversations.first()
+    // Pengaturan lanjutan, percakapan, lampiran: semuanya dipegang ViewModel
+    val contextSize = vm.contextSize
+    val cpuThreads = vm.cpuThreads
+    val temperature = vm.temperature
+    val conversations = vm.conversations
+    val activeConvId = vm.activeConvId
+    val currentConv = vm.currentConversation
+    val pendingAttachment = vm.pendingAttachment
+    val generationPhase = vm.generationPhase
 
     var composerText by remember { mutableStateOf("") }
-    var pendingAttachment by remember { mutableStateOf<UiAttachment?>(null) }
-    var generationPhase by remember { mutableStateOf(GenerationPhase.IDLE) }
+
+    val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val startModelDownload: (ModelManifestEntry) -> Unit = { entry ->
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        vm.startDownload(entry)
+    }
 
     val startNewConversation = {
-        val newId = "conv-${System.currentTimeMillis()}"
-        conversations = listOf(UiConversation(newId, "Percakapan baru", emptyList())) + conversations
-        activeConvId = newId
+        vm.newConversation()
         composerText = ""
-        pendingAttachment = null
-        searchEnabled = false
     }
     val displayNameOf: (Uri) -> String = { uri ->
         runCatching {
@@ -154,10 +157,10 @@ fun LocalAiAppRoot() {
         }.getOrNull() ?: "lampiran"
     }
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        if (uri != null) pendingAttachment = UiAttachment(displayNameOf(uri), "image", "Foto")
+        if (uri != null) vm.attachImage(uri, displayNameOf(uri))
     }
     val pickPdf = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        if (uri != null) pendingAttachment = UiAttachment(displayNameOf(uri), "pdf", "PDF")
+        if (uri != null) vm.attachPdf(uri, displayNameOf(uri))
     }
 
     BackHandler(enabled = drawerState.isOpen || currentScreen != ActiveScreen.CHAT) {
@@ -194,7 +197,7 @@ fun LocalAiAppRoot() {
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clickable {
-                                                activeConvId = c.id
+                                                vm.selectConversation(c.id)
                                                 currentScreen = ActiveScreen.CHAT
                                                 scope.launch { drawerState.close() }
                                             }
@@ -215,13 +218,7 @@ fun LocalAiAppRoot() {
                                             style = LocalAiTypography.metadata,
                                             color = colors.secondaryText,
                                             modifier = Modifier
-                                                .clickable {
-                                                    val remaining = conversations.filter { it.id != c.id }
-                                                    conversations = remaining.ifEmpty {
-                                                        listOf(UiConversation("conv-${System.currentTimeMillis()}", "Percakapan baru", emptyList()))
-                                                    }
-                                                    if (activeConvId == c.id) activeConvId = conversations.first().id
-                                                }
+                                                .clickable { vm.deleteConversation(c.id) }
                                                 .padding(start = 12.dp, top = 8.dp, bottom = 8.dp)
                                         )
                                     }
@@ -288,16 +285,7 @@ fun LocalAiAppRoot() {
                                 Box(
                                     modifier = Modifier
                                         .size(LocalAiDimens.MinTouchTarget)
-                                        .clickable {
-                                            val newId = "conv-${System.currentTimeMillis()}"
-                                            conversations = listOf(
-                                                UiConversation(newId, "Percakapan baru", emptyList())
-                                            ) + conversations
-                                            activeConvId = newId
-                                            composerText = ""
-                                            pendingAttachment = null
-                                            searchEnabled = false
-                                        }
+                                        .clickable { startNewConversation() }
                                         .semantics { contentDescription = "Percakapan baru" },
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -345,6 +333,10 @@ fun LocalAiAppRoot() {
                                     }
                                 } else {
                                     val listState = rememberLazyListState()
+                                    val lastMsg = currentConv.messages.lastOrNull()
+                                    LaunchedEffect(currentConv.id, currentConv.messages.size, lastMsg?.text?.length) {
+                                        if (currentConv.messages.isNotEmpty()) listState.scrollToItem(currentConv.messages.lastIndex)
+                                    }
                                     LazyColumn(
                                         state = listState,
                                         modifier = Modifier.fillMaxSize(),
@@ -367,12 +359,24 @@ fun LocalAiAppRoot() {
                                                             .background(colors.userBubble)
                                                             .padding(horizontal = 14.dp, vertical = 10.dp)
                                                     ) {
-                                                        SelectionContainer {
-                                                            Text(
-                                                                text = msg.text,
-                                                                style = LocalAiTypography.userBody,
-                                                                color = colors.foreground
-                                                            )
+                                                        Column {
+                                                            msg.attachment?.let { a ->
+                                                                Text(
+                                                                    text = "${if (a.type == "pdf") "PDF" else "Foto"} · ${a.name}",
+                                                                    style = LocalAiTypography.metadata,
+                                                                    color = colors.secondaryText,
+                                                                    maxLines = 1,
+                                                                    overflow = TextOverflow.Ellipsis
+                                                                )
+                                                                Spacer(Modifier.height(4.dp))
+                                                            }
+                                                            SelectionContainer {
+                                                                Text(
+                                                                    text = msg.text,
+                                                                    style = LocalAiTypography.userBody,
+                                                                    color = colors.foreground
+                                                                )
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -382,12 +386,28 @@ fun LocalAiAppRoot() {
                                                     modifier = Modifier.fillMaxWidth(),
                                                     horizontalAlignment = Alignment.Start
                                                 ) {
-                                                    SelectionContainer {
+                                                    if (msg.text.isBlank() && msg.status == "STREAMING") {
                                                         Text(
-                                                            text = msg.text,
-                                                            style = LocalAiTypography.assistantBody,
-                                                            color = colors.foreground
+                                                            text = vm.phaseLabel ?: "Menyiapkan…",
+                                                            style = LocalAiTypography.metadata,
+                                                            color = colors.secondaryText
                                                         )
+                                                    } else if (msg.text.isNotBlank()) {
+                                                        SelectionContainer {
+                                                            Text(
+                                                                text = msg.text,
+                                                                style = LocalAiTypography.assistantBody,
+                                                                color = colors.foreground
+                                                            )
+                                                        }
+                                                    }
+                                                    if (msg.status == "STOPPED") {
+                                                        Spacer(Modifier.height(4.dp))
+                                                        Text("Dihentikan", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                                    }
+                                                    msg.errorText?.let { err ->
+                                                        Spacer(Modifier.height(4.dp))
+                                                        Text(err, style = LocalAiTypography.metadata, color = colors.foreground)
                                                     }
                                                     if (msg.citations.isNotEmpty()) {
                                                         Spacer(Modifier.height(8.dp))
@@ -420,6 +440,17 @@ fun LocalAiAppRoot() {
                                     .background(colors.inputSurface)
                                     .padding(horizontal = 14.dp, vertical = 10.dp)
                             ) {
+                                vm.notice?.let { n ->
+                                    Text(
+                                        text = "$n  ✕",
+                                        style = LocalAiTypography.metadata,
+                                        color = colors.foreground,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { vm.dismissNotice() }
+                                            .padding(bottom = 8.dp)
+                                    )
+                                }
                                 pendingAttachment?.let { att ->
                                     Row(
                                         modifier = Modifier
@@ -439,7 +470,7 @@ fun LocalAiAppRoot() {
                                             text = "Hapus",
                                             style = LocalAiTypography.metadata,
                                             color = colors.foreground,
-                                            modifier = Modifier.clickable { pendingAttachment = null }
+                                            modifier = Modifier.clickable { vm.removeAttachment() }
                                         )
                                     }
                                 }
@@ -504,7 +535,7 @@ fun LocalAiAppRoot() {
                                                     if (!searchEnabled && savedTavilyKey.isBlank()) {
                                                         currentScreen = ActiveScreen.SETTINGS
                                                     } else {
-                                                        searchEnabled = !searchEnabled
+                                                        vm.updateSearchEnabled(!searchEnabled)
                                                     }
                                                 }
                                                 .padding(horizontal = 12.dp, vertical = 6.dp)
@@ -518,7 +549,7 @@ fun LocalAiAppRoot() {
                                         }
                                     }
 
-                                    val canSend = activeModel != null && (composerText.isNotBlank() || pendingAttachment != null)
+                                    val canSend = activeModel != null && pendingAttachment?.isProcessing != true && (composerText.isNotBlank() || pendingAttachment != null)
                                     val isGenerating = generationPhase != GenerationPhase.IDLE
 
                                     Box(
@@ -531,25 +562,11 @@ fun LocalAiAppRoot() {
                                             )
                                             .clickable(enabled = isGenerating || canSend) {
                                                 if (isGenerating) {
-                                                    generationPhase = GenerationPhase.IDLE
+                                                    vm.stop()
                                                 } else {
-                                                    val q = composerText.trim()
+                                                    val q = composerText
                                                     composerText = ""
-                                                    val userMsg = UiMessage(
-                                                        id = "m-${System.currentTimeMillis()}",
-                                                        isUser = true,
-                                                        text = q,
-                                                        attachment = pendingAttachment
-                                                    )
-                                                    pendingAttachment = null
-                                                    conversations = conversations.map { c ->
-                                                        if (c.id == activeConvId) {
-                                                            c.copy(
-                                                                title = if (c.messages.isEmpty()) q.take(36) else c.title,
-                                                                messages = c.messages + userMsg
-                                                            )
-                                                        } else c
-                                                    }
+                                                    vm.send(q)
                                                 }
                                             }
                                             .semantics {
@@ -580,32 +597,80 @@ fun LocalAiAppRoot() {
                                 Text("Kelola model", style = LocalAiTypography.headerModel, color = colors.foreground)
                             }
                             Spacer(Modifier.height(16.dp))
-                            ModelCatalog.entries.forEach { entry ->
-                                val isInstalled = installedModelIds.contains(entry.id)
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 10.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(entry.displayName, style = LocalAiTypography.headerModel, color = colors.foreground)
-                                        Text(
-                                            text = if (isInstalled) "Hapus" else "Unduh",
-                                            color = colors.foreground,
-                                            modifier = Modifier.clickable {
-                                                installedModelIds = if (isInstalled) {
-                                                    installedModelIds - entry.id
-                                                } else {
-                                                    installedModelIds + entry.id
+                            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                                ModelCatalog.entries.forEach { entry ->
+                                    val isInstalled = installedModelIds.contains(entry.id)
+                                    val ui = downloads[entry.id]
+                                    val status = ui?.status ?: DownloadStatus.IDLE
+                                    val busy = status == DownloadStatus.DOWNLOADING || status == DownloadStatus.VERIFYING
+                                    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(entry.displayName, style = LocalAiTypography.headerModel, color = colors.foreground)
+                                                Text(
+                                                    "${entry.quantization} · ${formatBytes(entry.totalSizeBytes)}",
+                                                    style = LocalAiTypography.metadata,
+                                                    color = colors.secondaryText
+                                                )
+                                            }
+                                            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                                                when {
+                                                    isInstalled -> {
+                                                        if (entry.id != activeModelId) {
+                                                            Text("Pakai", color = colors.foreground, modifier = Modifier.clickable { vm.selectModel(entry.id) })
+                                                        }
+                                                        Text("Hapus", color = colors.foreground, modifier = Modifier.clickable { vm.deleteModel(entry) })
+                                                    }
+                                                    busy -> Text("Jeda", color = colors.foreground, modifier = Modifier.clickable { vm.pauseDownload(entry) })
+                                                    status == DownloadStatus.PAUSED -> {
+                                                        Text("Lanjutkan", color = colors.foreground, modifier = Modifier.clickable { startModelDownload(entry) })
+                                                        Text("Hapus", color = colors.secondaryText, modifier = Modifier.clickable { vm.deleteModel(entry) })
+                                                    }
+                                                    else -> Text(
+                                                        if (status == DownloadStatus.FAILED) "Coba lagi" else "Unduh",
+                                                        color = colors.foreground,
+                                                        modifier = Modifier.clickable { startModelDownload(entry) }
+                                                    )
                                                 }
                                             }
-                                        )
+                                        }
+                                        Text(entry.roleSummary, style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                        if (!isInstalled && ui != null && status != DownloadStatus.IDLE) {
+                                            Spacer(Modifier.height(6.dp))
+                                            if (status == DownloadStatus.VERIFYING) {
+                                                LinearProgressIndicator(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    color = colors.interactive,
+                                                    trackColor = colors.hairline
+                                                )
+                                            } else {
+                                                LinearProgressIndicator(
+                                                    progress = { ui.fraction },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    color = colors.interactive,
+                                                    trackColor = colors.hairline
+                                                )
+                                            }
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = when (status) {
+                                                    DownloadStatus.VERIFYING -> "Memverifikasi berkas…"
+                                                    DownloadStatus.PAUSED -> "Dijeda · ${formatBytes(ui.downloadedBytes)} dari ${formatBytes(ui.totalBytes)}"
+                                                    DownloadStatus.FAILED -> ui.message ?: "Unduhan gagal."
+                                                    else -> "${formatBytes(ui.downloadedBytes)} dari ${formatBytes(ui.totalBytes)} · ${(ui.fraction * 100).toInt()}%"
+                                                },
+                                                style = LocalAiTypography.metadata,
+                                                color = if (status == DownloadStatus.FAILED) colors.foreground else colors.secondaryText
+                                            )
+                                        }
+                                        if (isInstalled && entry.id == activeModelId) {
+                                            Text("Sedang dipakai", style = LocalAiTypography.metadata, color = colors.secondaryText)
+                                        }
                                     }
-                                    Text(entry.roleSummary, style = LocalAiTypography.metadata, color = colors.secondaryText)
                                 }
                             }
                         }
@@ -689,7 +754,7 @@ fun LocalAiAppRoot() {
                                     OptionChip("Hapus key", false, colors) {
                                         runCatching { keyStore.clearApiKey() }
                                         savedTavilyKey = ""
-                                        searchEnabled = false
+                                        vm.updateSearchEnabled(false)
                                         tavilyStatus = "API key belum disimpan"
                                     }
                                 }
@@ -702,7 +767,7 @@ fun LocalAiAppRoot() {
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 listOf(1024, 2048, 4096).forEach { v ->
-                                    OptionChip(v.toString(), contextSize == v, colors) { contextSize = v }
+                                    OptionChip(v.toString(), contextSize == v, colors) { vm.updateContextSize(v) }
                                 }
                             }
                             Spacer(Modifier.height(12.dp))
@@ -710,7 +775,7 @@ fun LocalAiAppRoot() {
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 listOf(2, 4, 6).forEach { v ->
-                                    OptionChip(v.toString(), cpuThreads == v, colors) { cpuThreads = v }
+                                    OptionChip(v.toString(), cpuThreads == v, colors) { vm.updateCpuThreads(v) }
                                 }
                             }
                             Spacer(Modifier.height(12.dp))
@@ -718,7 +783,7 @@ fun LocalAiAppRoot() {
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 listOf(0.3f, 0.6f, 0.9f).forEach { v ->
-                                    OptionChip(v.toString(), temperature == v, colors) { temperature = v }
+                                    OptionChip(v.toString(), temperature == v, colors) { vm.updateTemperature(v) }
                                 }
                             }
                             Spacer(Modifier.height(24.dp))
@@ -742,7 +807,7 @@ fun LocalAiAppRoot() {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { activeModelId = e.id; showModelPicker = false }
+                                    .clickable { vm.selectModel(e.id); showModelPicker = false }
                                     .padding(vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
