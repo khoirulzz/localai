@@ -104,9 +104,9 @@ class LlamaCppEngine(
         val pendingChunk = StringBuilder()
         var lastFlushMs = SystemClock.elapsedRealtime()
 
-        val status = withContext(inferenceDispatcher) {
+        val result = withContext(inferenceDispatcher) {
             _state.value = EngineState.GENERATING
-            LlamaBridge.nativeGenerateStream(
+            val status = LlamaBridge.nativeGenerateStream(
                 formattedPrompt = formattedPrompt,
                 imagePath = request.imagePath,
                 maxOutputTokens = request.maxOutputTokens,
@@ -128,7 +128,9 @@ class LlamaCppEngine(
                     }
                 }
             )
+            status to (status >= 0 && LlamaBridge.nativeOutputLimitReached())
         }
+        val (status, outputLimitReached) = result
 
         if (pendingChunk.isNotEmpty()) {
             send(InferenceEvent.TextDelta(pendingChunk.toString()))
@@ -159,7 +161,7 @@ class LlamaCppEngine(
             cancelRequested.get() || status == STATUS_ABORTED || !producerJob.isActive ->
                 send(InferenceEvent.Stopped(fullBuilder.toString(), stats))
             status < 0 -> send(InferenceEvent.Failed(describeFailure(status)))
-            else -> send(InferenceEvent.Completed(stats))
+            else -> send(InferenceEvent.Completed(stats, outputLimitReached))
         }
     }.buffer(Channel.UNLIMITED)
 
