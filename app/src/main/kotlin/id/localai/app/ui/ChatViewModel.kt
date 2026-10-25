@@ -56,6 +56,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     var activeModelId by mutableStateOf<String?>(prefs.getString(KEY_ACTIVE_MODEL, null))
         private set
 
+    private var nextReplyWithoutThinking = false
+
+    fun continueLastResponse() {
+        if (generationPhase != GenerationPhase.IDLE || !historyReady) return
+        val latest = currentConversation.messages.lastOrNull() ?: return
+        if (latest.isUser || latest.status != "LIMIT_REACHED") return
+        nextReplyWithoutThinking = true
+        send("Lanjutkan jawaban sebelumnya dari bagian terakhir yang belum selesai. " +
+            "Jangan mengulang poin yang sudah dijelaskan.")
+    }
+
     var thinkingMode by mutableStateOf(prefs.getString("think_${activeModelId}", "OFF") ?: "OFF")
         private set
     fun updateThinkingMode(mode: String) {
@@ -363,8 +374,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         generationPhase = GenerationPhase.PREPARING
 
         val webEnabled = searchEnabled
+        val turnThinking = if (nextReplyWithoutThinking) "OFF" else thinkingMode
+        nextReplyWithoutThinking = false
         generationJob = viewModelScope.launch {
-            runGeneration(convId, assistantId, entry, question, att, prior, documentId, webEnabled)
+            runGeneration(convId, assistantId, entry, question, att, prior, documentId, webEnabled, turnThinking)
         }
     }
 
@@ -382,10 +395,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         attachment: UiAttachment?,
         prior: List<UiMessage>,
         documentId: String?,
-        webEnabled: Boolean
+        webEnabled: Boolean,
+        requestedThinking: String
     ) {
         val answer = StringBuilder()
-        val requestedThinking = thinkingMode
         val thinkingEnabled = requestedThinking != "OFF"
         try {
             // 1) Muat model bila belum (atau pengaturan berubah).
