@@ -28,6 +28,9 @@ object LlamaBridge {
         callback: NativeStreamCallback
     ): Int
 
+    /** True only when decoding stopped at the generation/context token boundary, not EOS. */
+    external fun nativeOutputLimitReached(): Boolean
+
     external fun nativeSupportsVision(): Boolean
 
     external fun nativeCancel()

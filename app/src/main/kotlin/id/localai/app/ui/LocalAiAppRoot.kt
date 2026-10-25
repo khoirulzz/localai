@@ -459,6 +459,31 @@ fun LocalAiAppRoot() {
                                                             color = colors.secondaryText
                                                         )
                                                     }
+                                                    if (msg.status == "LIMIT_REACHED") {
+                                                        Spacer(Modifier.height(9.dp))
+                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                            Text(
+                                                                "Batas output tercapai",
+                                                                style = LocalAiTypography.metadata,
+                                                                color = colors.secondaryText
+                                                            )
+                                                            Spacer(Modifier.width(12.dp))
+                                                            Text(
+                                                                "Lanjutkan",
+                                                                style = LocalAiTypography.metadata,
+                                                                color = colors.foreground,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                modifier = Modifier
+                                                                    .clip(RoundedCornerShape(12.dp))
+                                                                    .background(colors.inputSurface)
+                                                                    .clickable(enabled = generationPhase == GenerationPhase.IDLE &&
+                                                                        msg.id == currentConv.messages.lastOrNull()?.id) {
+                                                                        vm.continueLastResponse()
+                                                                    }
+                                                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                                                            )
+                                                        }
+                                                    }
                                                     if (msg.status == "STOPPED") {
                                                         Spacer(Modifier.height(4.dp))
                                                         Text("Dihentikan", style = LocalAiTypography.metadata, color = colors.secondaryText)
@@ -1010,7 +1035,7 @@ fun LocalAiAppRoot() {
                                 steps = 11,
                                 colors = colors,
                                 valueText = { "${it.roundToInt()} token" },
-                                caption = { "Sekitar ${(it * 0.7f / 10).toInt() * 10} kata percakapan yang diingat. Makin besar, makin banyak RAM dan makin lambat." },
+                                caption = { "Jendela bersama untuk konteks, berpikir, dan jawaban. Sekitar setengahnya disisihkan untuk output panjang." },
                                 onCommit = { vm.updateContextSize(it.roundToInt()) }
                             )
                             Spacer(Modifier.height(20.dp))

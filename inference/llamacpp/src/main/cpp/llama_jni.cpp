@@ -36,6 +36,7 @@ namespace {
 
 std::mutex g_mutex;
 std::atomic<bool> g_abort_requested{false};
+std::atomic<bool> g_last_output_limit_reached{false};
 bool g_loaded = false;
 bool g_backend_ready = false;
 int g_ctx_tokens = 2048;
@@ -285,6 +286,7 @@ Java_id_localai_inference_llamacpp_LlamaBridge_nativeGenerateStream(
         jint maxOutputTokens, jfloat temperature, jobject callback) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_abort_requested.store(false);
+    g_last_output_limit_reached.store(false);
     if (!g_loaded) return status::NOT_LOADED;
 
     jclass cbClass = env->GetObjectClass(callback);
@@ -357,12 +359,16 @@ Java_id_localai_inference_llamacpp_LlamaBridge_nativeGenerateStream(
     std::u16string ready;
     int generated = 0;
     int result = 0;
+    bool ended_by_eog = false;
 
     for (int i = 0; i < max_new; i++) {
         if (g_abort_requested.load()) { result = status::ABORTED; break; }
 
         llama_token tok = llama_sampler_sample(sampler, g_ctx, -1);
-        if (llama_vocab_is_eog(g_vocab, tok)) break;
+        if (llama_vocab_is_eog(g_vocab, tok)) {
+            ended_by_eog = true;
+            break;
+        }
 
         char buf[256];
         int n = llama_token_to_piece(g_vocab, tok, buf, sizeof(buf), 0, /*special=*/false);
@@ -397,10 +403,20 @@ Java_id_localai_inference_llamacpp_LlamaBridge_nativeGenerateStream(
         if (!ready.empty()) emit_to_kotlin(env, callback, onPiece, ready);
     }
 
+    if (result == 0 && !ended_by_eog && generated >= max_new) {
+        g_last_output_limit_reached.store(true);
+        LOGI("Generation reached output/context limit: generated=%d max=%d ctx=%d prompt=%d",
+             generated, max_new, g_ctx_tokens, n_past);
+    }
     llama_sampler_free(sampler);
     return result != 0 ? result : generated;
 #else
     (void) formattedPrompt; (void) imagePath; (void) maxOutputTokens; (void) temperature;
     return status::NOT_LOADED;
 #endif
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_id_localai_inference_llamacpp_LlamaBridge_nativeOutputLimitReached(JNIEnv*, jobject) {
+    return g_last_output_limit_reached.load() ? JNI_TRUE : JNI_FALSE;
 }

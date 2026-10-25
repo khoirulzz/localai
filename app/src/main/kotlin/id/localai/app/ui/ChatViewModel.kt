@@ -18,6 +18,7 @@ import id.localai.app.models.DownloadUi
 import id.localai.app.models.ModelCatalog
 import id.localai.app.models.ModelManifestEntry
 import id.localai.app.orchestrator.ContextBuilder
+import id.localai.app.orchestrator.OutputBudget
 import id.localai.app.search.SearchOutcome
 import id.localai.app.search.WebSearchResult
 import id.localai.inference.api.ChatTurn
@@ -54,6 +55,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     var activeModelId by mutableStateOf<String?>(prefs.getString(KEY_ACTIVE_MODEL, null))
         private set
+
+    private var nextReplyWithoutThinking = false
+
+    fun continueLastResponse() {
+        if (generationPhase != GenerationPhase.IDLE || !historyReady) return
+        val latest = currentConversation.messages.lastOrNull() ?: return
+        if (latest.isUser || latest.status != "LIMIT_REACHED") return
+        nextReplyWithoutThinking = true
+        send("Lanjutkan jawaban sebelumnya dari bagian terakhir yang belum selesai. " +
+            "Jangan mengulang poin yang sudah dijelaskan.")
+    }
 
     var thinkingMode by mutableStateOf(prefs.getString("think_${activeModelId}", "OFF") ?: "OFF")
         private set
@@ -362,8 +374,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         generationPhase = GenerationPhase.PREPARING
 
         val webEnabled = searchEnabled
+        val turnThinking = if (nextReplyWithoutThinking) "OFF" else thinkingMode
+        nextReplyWithoutThinking = false
         generationJob = viewModelScope.launch {
-            runGeneration(convId, assistantId, entry, question, att, prior, documentId, webEnabled)
+            runGeneration(convId, assistantId, entry, question, att, prior, documentId, webEnabled, turnThinking)
         }
     }
 
@@ -381,10 +395,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         attachment: UiAttachment?,
         prior: List<UiMessage>,
         documentId: String?,
-        webEnabled: Boolean
+        webEnabled: Boolean,
+        requestedThinking: String
     ) {
         val answer = StringBuilder()
-        val requestedThinking = thinkingMode
         val thinkingEnabled = requestedThinking != "OFF"
         try {
             // 1) Muat model bila belum (atau pengaturan berubah).
@@ -427,24 +441,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val session = conversations.firstOrNull { it.id == convId }
             val history = prior
                 .filter { it.createdAtMs > (session?.summarizedThroughMs ?: 0L) }
-                .filter { (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank() }
+                .filter { it.status in setOf("COMPLETED", "STOPPED", "LIMIT_REACHED") && it.text.isNotBlank() }
                 .map { ChatTurn(if (it.isUser) MessageRole.USER else MessageRole.ASSISTANT, it.text) }
+            val answerLimit = OutputBudget.answerTokens(contextSize)
+            val firstPassLimit = OutputBudget.thinkingTokens(contextSize, requestedThinking)
             val turns = ContextBuilder.buildBoundedTurns(
                 history, question, pdfChunks, web, contextSize, customInstructions,
-                sessionSummary = session?.summary.orEmpty()
+                sessionSummary = session?.summary.orEmpty(),
+                reservedOutputTokens = answerLimit
             )
             val imagePath = if (attachment?.type == "image") attachment.localPath else null
             val citations = buildCitations(pdfChunks, web)
 
+            var answerPassRequired = false
+            var firstPassStats: RunStats? = null
             graph.engine.generate(
                 InferenceRequest(
                     messages = turns,
                     imagePath = imagePath,
-                    maxOutputTokens = when (requestedThinking) {
-                        "DEEP" -> 1280
-                        "STANDARD" -> 960
-                        else -> MAX_OUTPUT_TOKENS
-                    }.coerceAtMost((contextSize * 0.25f).toInt().coerceAtLeast(256)),
+                    maxOutputTokens = firstPassLimit,
                     thinkingEnabled = thinkingEnabled,
                     temperature = temperature
                 )
@@ -459,14 +474,86 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         updateMessage(convId, assistantId) { it.copy(text = shown, thinking = thought) }
                     }
                     is InferenceEvent.Completed -> {
-                        if (answer.isBlank()) {
-                            finishMessage(convId, assistantId, "FAILED", "Model tidak menghasilkan jawaban. Coba kirim ulang.", stats = event.stats)
+                        val (thought, mainText) = splitModelOutput(
+                            answer.toString(), thinkingEnabled, entry.promptFormat
+                        )
+                        if (thinkingEnabled && mainText.isBlank() && thought.isNotBlank()) {
+                            answerPassRequired = true
+                            firstPassStats = event.stats
+                            updateMessage(convId, assistantId) { it.copy(thinking = thought) }
+                        } else if (answer.isBlank()) {
+                            finishMessage(convId, assistantId, "FAILED",
+                                "Model tidak menghasilkan jawaban.", stats = event.stats)
                         } else {
-                            finishMessage(convId, assistantId, "COMPLETED", citations = citations, stats = event.stats)
+                            finishMessage(convId, assistantId,
+                                if (event.outputLimitReached) "LIMIT_REACHED" else "COMPLETED",
+                                citations = citations, stats = event.stats)
                         }
                     }
                     is InferenceEvent.Stopped -> finishMessage(convId, assistantId, "STOPPED", stats = event.stats)
                     is InferenceEvent.Failed -> finishMessage(convId, assistantId, "FAILED", event.cause)
+                }
+            }
+
+            if (answerPassRequired && !stopRequested) {
+                // A small model can use its entire allowance internally without
+                // emitting an answer. Keep the reasoning and request a direct final pass.
+                generationPhase = GenerationPhase.PREPARING
+                loadingLabel = "Menyusun jawaban akhir…"
+                val thoughtText = splitModelOutput(
+                    answer.toString(), true, entry.promptFormat
+                ).first.takeLast(650)
+                val directTurns = turns.dropLast(1) + listOf(
+                    ChatTurn(MessageRole.SYSTEM,
+                        "Berikan jawaban akhir secara langsung dan jelas. " +
+                        "Jangan ulangi proses analisis. Catatan yang sudah dihitung: $thoughtText"),
+                    turns.last()
+                )
+                val finalOutput = StringBuilder()
+                graph.engine.generate(
+                    InferenceRequest(
+                        messages = directTurns,
+                        imagePath = imagePath,
+                        maxOutputTokens = answerLimit,
+                        thinkingEnabled = false,
+                        temperature = temperature
+                    )
+                ).collect { event ->
+                    when (event) {
+                        InferenceEvent.Preparing -> Unit
+                        InferenceEvent.VisionEncoding -> generationPhase = GenerationPhase.READING_IMAGE
+                        is InferenceEvent.TextDelta -> {
+                            finalOutput.append(event.text)
+                            generationPhase = GenerationPhase.STREAMING
+                            val visible = splitModelOutput(
+                                finalOutput.toString(), false, entry.promptFormat
+                            ).second
+                            updateMessage(convId, assistantId) { it.copy(text = visible) }
+                        }
+                        is InferenceEvent.Completed -> {
+                            val previous = firstPassStats
+                            val stats = if (previous == null) event.stats else {
+                                val n = previous.decodeTokens + event.stats.decodeTokens
+                                val duration = (previous.elapsedMs - previous.ttftMs +
+                                    event.stats.elapsedMs - event.stats.ttftMs).coerceAtLeast(1L)
+                                event.stats.copy(
+                                    decodeTokens = n,
+                                    elapsedMs = previous.elapsedMs + event.stats.elapsedMs,
+                                    decodeTokPerSec = n * 1000f / duration
+                                )
+                            }
+                            finishMessage(
+                                convId, assistantId,
+                                if (event.outputLimitReached) "LIMIT_REACHED" else "COMPLETED",
+                                citations = citations, stats = stats
+                            )
+                        }
+                        is InferenceEvent.Stopped ->
+                            finishMessage(convId, assistantId, "STOPPED", stats = event.stats)
+                        is InferenceEvent.Failed ->
+                            finishMessage(convId, assistantId, "FAILED",
+                                event.cause, stats = firstPassStats)
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -489,10 +576,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val conv = conversations.firstOrNull { it.id == convId } ?: return
         val unsummarized = prior.filter {
             it.createdAtMs > conv.summarizedThroughMs &&
-                (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank()
+                it.status in setOf("COMPLETED", "STOPPED", "LIMIT_REACHED") && it.text.isNotBlank()
         }
         val estimatedTokens = unsummarized.sumOf { it.text.length / 4 + 1 }
-        if (estimatedTokens < (contextSize * 0.42f * 0.75f).toInt() || unsummarized.size < 10) return
+        if (estimatedTokens < (contextSize * 0.32f * 0.75f).toInt() || unsummarized.size < 10) return
         val old = unsummarized.dropLast(6).take(16)
         if (old.size < 4) return
         loadingLabel = "Meringkas percakapan…"
@@ -678,6 +765,5 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_THREADS = "threads"
         const val KEY_TEMP = "temp"
         const val KEY_CUSTOM = "custom_instructions"
-        const val MAX_OUTPUT_TOKENS = 768
     }
 }
