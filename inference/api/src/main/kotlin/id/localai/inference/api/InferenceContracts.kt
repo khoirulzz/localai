@@ -67,7 +67,7 @@ sealed interface InferenceEvent {
     data object Preparing : InferenceEvent
     data object VisionEncoding : InferenceEvent
     data class TextDelta(val text: String) : InferenceEvent
-    data class Completed(val stats: RunStats) : InferenceEvent
+    data class Completed(val stats: RunStats, val outputLimitReached: Boolean = false) : InferenceEvent
     data class Stopped(val partialText: String, val stats: RunStats) : InferenceEvent
     data class Failed(val cause: String) : InferenceEvent
 }
