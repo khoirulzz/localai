@@ -477,7 +477,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val (thought, mainText) = splitModelOutput(
                             answer.toString(), thinkingEnabled, entry.promptFormat
                         )
-                        if (thinkingEnabled && event.outputLimitReached && mainText.isBlank()) {
+                        if (thinkingEnabled && mainText.isBlank() && thought.isNotBlank()) {
                             answerPassRequired = true
                             firstPassStats = event.stats
                             updateMessage(convId, assistantId) { it.copy(thinking = thought) }
