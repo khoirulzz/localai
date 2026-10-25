@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -43,6 +43,21 @@ jobs:
           test -f inference/llamacpp/src/main/cpp/llama.cpp/CMakeLists.txt
           test -f inference/llamacpp/src/main/cpp/llama.cpp/tools/mtmd/CMakeLists.txt
 
+      - name: Build offline image runtime (stable-diffusion.cpp arm64)
+        run: |
+          git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git image-native
+          git -C image-native checkout 0886f11b6b8b4d1f6259e0f1337cae554284c37a
+          git -C image-native submodule update --init --recursive
+          cmake -S image-native -B image-native-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/27.0.12077973/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF -DGGML_OPENMP=OFF
+          cmake --build image-native-build --target sd-cli -j 4
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp image-native-build/bin/sd-cli app/src/main/jniLibs/arm64-v8a/libsdcli.so
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
@@ -64,7 +79,7 @@ jobs:
 
       - name: Package update ZIP
         run: |
-          zip -j Nalaro-AI-v0.4.2-APK.zip app/build/outputs/apk/debug/app-debug.apk
+          zip -j Nalaro-AI-v0.4.3-Image-APK.zip app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -72,7 +87,7 @@ jobs:
           name: local-ai-debug-apk
           path: |
             app/build/outputs/apk/debug/*.apk
-            Nalaro-AI-v0.4.2-APK.zip
+            Nalaro-AI-v0.4.3-Image-APK.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -86,6 +101,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk local-ai-debug.apk
-          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.2-APK.zip \
+          gh release create "build-${{ github.run_number }}" local-ai-debug.apk Nalaro-AI-v0.4.3-Image-APK.zip \
             --title "Debug build #${{ github.run_number }}" \
             --notes "Debug APK (arm64-v8a), commit ${{ github.sha }}" --prerelease
