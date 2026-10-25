@@ -428,7 +428,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val session = conversations.firstOrNull { it.id == convId }
             val history = prior
                 .filter { it.createdAtMs > (session?.summarizedThroughMs ?: 0L) }
-                .filter { (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank() }
+                .filter { it.status in setOf("COMPLETED", "STOPPED", "LIMIT_REACHED") && it.text.isNotBlank() }
                 .map { ChatTurn(if (it.isUser) MessageRole.USER else MessageRole.ASSISTANT, it.text) }
             val answerLimit = OutputBudget.answerTokens(contextSize)
             val firstPassLimit = OutputBudget.thinkingTokens(contextSize, requestedThinking)
@@ -440,6 +440,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val imagePath = if (attachment?.type == "image") attachment.localPath else null
             val citations = buildCitations(pdfChunks, web)
 
+            var answerPassRequired = false
+            var firstPassStats: RunStats? = null
             graph.engine.generate(
                 InferenceRequest(
                     messages = turns,
@@ -459,10 +461,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         updateMessage(convId, assistantId) { it.copy(text = shown, thinking = thought) }
                     }
                     is InferenceEvent.Completed -> {
-                        if (answer.isBlank()) {
-                            finishMessage(convId, assistantId, "FAILED", "Model tidak menghasilkan jawaban. Coba kirim ulang.", stats = event.stats)
+                        val (thought, mainText) = splitModelOutput(
+                            answer.toString(), thinkingEnabled, entry.promptFormat
+                        )
+                        if (thinkingEnabled && event.outputLimitReached && mainText.isBlank()) {
+                            answerPassRequired = true
+                            firstPassStats = event.stats
+                            updateMessage(convId, assistantId) { it.copy(thinking = thought) }
+                        } else if (answer.isBlank()) {
+                            finishMessage(convId, assistantId, "FAILED",
+                                "Model tidak menghasilkan jawaban.", stats = event.stats)
                         } else {
-                            finishMessage(convId, assistantId, "COMPLETED", citations = citations, stats = event.stats)
+                            finishMessage(convId, assistantId,
+                                if (event.outputLimitReached) "LIMIT_REACHED" else "COMPLETED",
+                                citations = citations, stats = event.stats)
                         }
                     }
                     is InferenceEvent.Stopped -> finishMessage(convId, assistantId, "STOPPED", stats = event.stats)
@@ -489,10 +501,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val conv = conversations.firstOrNull { it.id == convId } ?: return
         val unsummarized = prior.filter {
             it.createdAtMs > conv.summarizedThroughMs &&
-                (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank()
+                it.status in setOf("COMPLETED", "STOPPED", "LIMIT_REACHED") && it.text.isNotBlank()
         }
         val estimatedTokens = unsummarized.sumOf { it.text.length / 4 + 1 }
-        if (estimatedTokens < (contextSize * 0.42f * 0.75f).toInt() || unsummarized.size < 10) return
+        if (estimatedTokens < (contextSize * 0.32f * 0.75f).toInt() || unsummarized.size < 10) return
         val old = unsummarized.dropLast(6).take(16)
         if (old.size < 4) return
         loadingLabel = "Meringkas percakapan…"
