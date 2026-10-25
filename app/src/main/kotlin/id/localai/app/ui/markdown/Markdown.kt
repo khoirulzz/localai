@@ -260,6 +260,12 @@ object Markdown {
     private const val ESCAPABLE = "\\`*_{}[]()#+-.!|~<>"
 
     fun parseInline(s: String): List<MdInline> {
+        // Lindungi strong emphasis di akhir baris: marker penutup tepat sebelum EOF
+        // harus tetap dirender setelah output stream selesai.
+        if (s.length > 4 && s.startsWith("**") && s.endsWith("**") &&
+            s.indexOf("**", 2) == s.length - 2) {
+            return listOf(MdInline.Bold(parseInline(s.substring(2, s.length - 2))))
+        }
         val out = mutableListOf<MdInline>()
         val buf = StringBuilder()
         fun flush() {
