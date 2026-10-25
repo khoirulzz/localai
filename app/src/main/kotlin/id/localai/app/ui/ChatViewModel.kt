@@ -18,6 +18,7 @@ import id.localai.app.models.DownloadUi
 import id.localai.app.models.ModelCatalog
 import id.localai.app.models.ModelManifestEntry
 import id.localai.app.orchestrator.ContextBuilder
+import id.localai.app.orchestrator.OutputBudget
 import id.localai.app.search.SearchOutcome
 import id.localai.app.search.WebSearchResult
 import id.localai.inference.api.ChatTurn
@@ -429,9 +430,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 .filter { it.createdAtMs > (session?.summarizedThroughMs ?: 0L) }
                 .filter { (it.status == "COMPLETED" || it.status == "STOPPED") && it.text.isNotBlank() }
                 .map { ChatTurn(if (it.isUser) MessageRole.USER else MessageRole.ASSISTANT, it.text) }
+            val answerLimit = OutputBudget.answerTokens(contextSize)
+            val firstPassLimit = OutputBudget.thinkingTokens(contextSize, requestedThinking)
             val turns = ContextBuilder.buildBoundedTurns(
                 history, question, pdfChunks, web, contextSize, customInstructions,
-                sessionSummary = session?.summary.orEmpty()
+                sessionSummary = session?.summary.orEmpty(),
+                reservedOutputTokens = answerLimit
             )
             val imagePath = if (attachment?.type == "image") attachment.localPath else null
             val citations = buildCitations(pdfChunks, web)
@@ -440,11 +444,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 InferenceRequest(
                     messages = turns,
                     imagePath = imagePath,
-                    maxOutputTokens = when (requestedThinking) {
-                        "DEEP" -> 1280
-                        "STANDARD" -> 960
-                        else -> MAX_OUTPUT_TOKENS
-                    }.coerceAtMost((contextSize * 0.25f).toInt().coerceAtLeast(256)),
+                    maxOutputTokens = firstPassLimit,
                     thinkingEnabled = thinkingEnabled,
                     temperature = temperature
                 )
@@ -678,6 +678,5 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_THREADS = "threads"
         const val KEY_TEMP = "temp"
         const val KEY_CUSTOM = "custom_instructions"
-        const val MAX_OUTPUT_TOKENS = 768
     }
 }
