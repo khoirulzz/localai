@@ -62,6 +62,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import id.localai.app.image.ImageStudioScreen
 import id.localai.app.models.ModelCatalog
 import id.localai.app.models.ModelManifestEntry
 import id.localai.app.ui.theme.*
@@ -70,6 +71,7 @@ import kotlinx.coroutines.launch
 
 enum class ActiveScreen {
     CHAT,
+    IMAGE,
     MODEL_MANAGER,
     SETTINGS
 }
@@ -212,7 +214,7 @@ fun LocalAiAppRoot() {
         ) {
             ModalNavigationDrawer(
                 drawerState = drawerState,
-                gesturesEnabled = currentScreen == ActiveScreen.CHAT,
+                gesturesEnabled = currentScreen == ActiveScreen.CHAT || currentScreen == ActiveScreen.IMAGE,
                 drawerContent = {
                     ModalDrawerSheet(
                         drawerContainerColor = colors.background,
@@ -224,6 +226,10 @@ fun LocalAiAppRoot() {
                             DrawerRow("✎  Percakapan baru", colors) {
                                 startNewConversation()
                                 currentScreen = ActiveScreen.CHAT
+                                scope.launch { drawerState.close() }
+                            }
+                            DrawerRow("Gambar", colors) {
+                                currentScreen = ActiveScreen.IMAGE
                                 scope.launch { drawerState.close() }
                             }
                             Spacer(Modifier.height(8.dp))
@@ -275,6 +281,9 @@ fun LocalAiAppRoot() {
             ) {
             Box(modifier = Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
                 when (currentScreen) {
+                    ActiveScreen.IMAGE -> ImageStudioScreen(colors) {
+                        scope.launch { drawerState.open() }
+                    }
                     ActiveScreen.CHAT -> {
                         Column(modifier = Modifier.fillMaxSize()) {
                             // 5.1 Header (56dp, no decorative badges)
