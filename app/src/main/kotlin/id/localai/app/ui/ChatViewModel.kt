@@ -481,6 +481,68 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     is InferenceEvent.Failed -> finishMessage(convId, assistantId, "FAILED", event.cause)
                 }
             }
+
+            if (answerPassRequired && !stopRequested) {
+                // A small model can use its entire allowance internally without
+                // emitting an answer. Keep the reasoning and request a direct final pass.
+                generationPhase = GenerationPhase.PREPARING
+                loadingLabel = "Menyusun jawaban akhir…"
+                val thoughtText = splitModelOutput(
+                    answer.toString(), true, entry.promptFormat
+                ).first.takeLast(650)
+                val directTurns = turns.dropLast(1) + listOf(
+                    ChatTurn(MessageRole.SYSTEM,
+                        "Berikan jawaban akhir secara langsung dan jelas. " +
+                        "Jangan ulangi proses analisis. Catatan yang sudah dihitung: $thoughtText"),
+                    turns.last()
+                )
+                val finalOutput = StringBuilder()
+                graph.engine.generate(
+                    InferenceRequest(
+                        messages = directTurns,
+                        imagePath = imagePath,
+                        maxOutputTokens = answerLimit,
+                        thinkingEnabled = false,
+                        temperature = temperature
+                    )
+                ).collect { event ->
+                    when (event) {
+                        InferenceEvent.Preparing -> Unit
+                        InferenceEvent.VisionEncoding -> generationPhase = GenerationPhase.READING_IMAGE
+                        is InferenceEvent.TextDelta -> {
+                            finalOutput.append(event.text)
+                            generationPhase = GenerationPhase.STREAMING
+                            val visible = splitModelOutput(
+                                finalOutput.toString(), false, entry.promptFormat
+                            ).second
+                            updateMessage(convId, assistantId) { it.copy(text = visible) }
+                        }
+                        is InferenceEvent.Completed -> {
+                            val previous = firstPassStats
+                            val stats = if (previous == null) event.stats else {
+                                val n = previous.decodeTokens + event.stats.decodeTokens
+                                val duration = (previous.elapsedMs - previous.ttftMs +
+                                    event.stats.elapsedMs - event.stats.ttftMs).coerceAtLeast(1L)
+                                event.stats.copy(
+                                    decodeTokens = n,
+                                    elapsedMs = previous.elapsedMs + event.stats.elapsedMs,
+                                    decodeTokPerSec = n * 1000f / duration
+                                )
+                            }
+                            finishMessage(
+                                convId, assistantId,
+                                if (event.outputLimitReached) "LIMIT_REACHED" else "COMPLETED",
+                                citations = citations, stats = stats
+                            )
+                        }
+                        is InferenceEvent.Stopped ->
+                            finishMessage(convId, assistantId, "STOPPED", stats = event.stats)
+                        is InferenceEvent.Failed ->
+                            finishMessage(convId, assistantId, "FAILED",
+                                event.cause, stats = firstPassStats)
+                    }
+                }
+            }
         } catch (e: CancellationException) {
             finishMessage(convId, assistantId, "STOPPED")
             throw e
